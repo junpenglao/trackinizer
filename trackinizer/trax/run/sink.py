@@ -71,10 +71,10 @@ class Sink(Protocol):
         ...
 
     def set_cli_session_id(self, cli_session_id: str) -> None:
-        """Record the CLI's own session id, backfilled to the server at close.
+        """Set the CLI's immutable native session identity.
 
-        Lets a fresh run become resumable on its next ``--resume``. A local-file
-        sink has no server session and ignores it.
+        A proven resume sets it before ``open`` for central reconciliation; a
+        fresh run can backfill it at close. A local-file sink ignores it.
         """
         ...
 
@@ -249,15 +249,23 @@ class TrackinizerSink:
         return self._granted_actor
 
     def set_cli_session_id(self, cli_session_id: str) -> None:
-        """Record the CLI's own session id (discovered mid-run).
+        """Set the CLI's immutable native session identity.
 
-        Backfilled to the server at :meth:`close` so the session becomes
-        correlatable on a later ``--resume``. The first non-empty id wins -- a
-        CLI session id is stable for the run, so later files of the same run
-        carry the same id.
+        A pre-launch resume proof sets this before :meth:`open`, so the central
+        server can reconcile the existing AgentSession and return its next
+        sequence. A fresh run may discover the id after opening; it is then
+        backfilled at :meth:`close`. Rebinding to another identity is always an
+        error rather than silently attaching one capture to two transcripts.
         """
-        if cli_session_id and self._cli_session_id is None:
+        if not cli_session_id:
+            raise ValueError("CLI session identity cannot be empty")
+        if self._cli_session_id is None:
             self._cli_session_id = cli_session_id
+        elif self._cli_session_id != cli_session_id:
+            raise ValueError(
+                f"CLI session identity is {self._cli_session_id!r}; "
+                f"cannot replace it with {cli_session_id!r}"
+            )
 
     def _ensure_session(self) -> None:
         if self._session_id is not None:
@@ -265,6 +273,7 @@ class TrackinizerSink:
         resp = self._client.session_start(
             SessionStart(
                 cli=self._cli,
+                cli_session_id=self._cli_session_id,
                 actor=self._actor,
                 rooms=list(self._rooms) or None,
                 started=datetime.now(UTC),

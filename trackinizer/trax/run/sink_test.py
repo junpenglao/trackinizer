@@ -12,6 +12,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from trackinizer.client.client import Client
 from trackinizer.trax.run.adapters.base import Event
 from trackinizer.trax.run.sink import (
@@ -194,6 +196,31 @@ class TestTrackinizerSink:
         sink.close()
         # The first appended event continues at the resume seq, not 0.
         assert client.appended[0][1][0].seq == 5
+
+    def test_prebound_cli_session_id_is_sent_on_start(self) -> None:
+        """A proven resume identity must reach the initial reconciliation."""
+        client = _FakeClient()
+        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink.set_cli_session_id("native-resume-id")
+
+        sink.open()
+
+        assert client.started[0].cli_session_id == "native-resume-id"
+
+    def test_cli_session_identity_is_immutable(self) -> None:
+        client = _FakeClient()
+        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink.set_cli_session_id("native-id")
+        sink.open()
+        sink.set_cli_session_id("native-id")
+
+        with pytest.raises(ValueError, match="cannot replace"):
+            sink.set_cli_session_id("different-id")
+
+    def test_empty_cli_session_identity_is_rejected(self) -> None:
+        sink = TrackinizerSink(cast(Client, _FakeClient()), "claude")
+        with pytest.raises(ValueError, match="empty"):
+            sink.set_cli_session_id("")
 
     def test_open_is_noop_on_file_sink(self) -> None:
         """A local FileSink has no server session: ``open`` returns None."""
