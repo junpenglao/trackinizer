@@ -18,7 +18,7 @@ provenance").
 The row's ``message`` is **not** opaque JSON: it is one :data:`Message`
 value type, discriminated by the row's ``kind`` column. The capture
 adapters normalize each CLI's native log shape into one of these, so the
-same query works across claude, codex, gemini, and cursor. The vocabulary
+same query works across claude, codex, agy, and cursor. The vocabulary
 mirrors the provider-unified model interface in ``sagent/types/runtime.py``.
 
 The message union::

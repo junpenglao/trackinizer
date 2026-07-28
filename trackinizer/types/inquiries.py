@@ -1059,7 +1059,7 @@ class AgentSession(Artifact):
             sql_type="TEXT",
         ),
     )
-    """Which CLI was wrapped (``claude``, ``gemini``, ``codex``, ``cursor``)."""
+    """Which CLI was wrapped (``claude``, ``agy``, ``codex``, ``cursor``)."""
 
     cli_session_id: str | None = field(
         default=None,

@@ -456,7 +456,7 @@ verb_name   ::= "help" | "profile" | "next" | "search" | "recent"
 - `trax version` -- print the CLI version.
 - `trax send @actor[:room] TEXT...` -- inject a message into a live agent
   session addressed by its routing name (its `run --as` owner).
-- `trax run claude|gemini|codex [--out FILE] [--verbose] [--dry-run]
+- `trax run claude|agy|codex [--out FILE] [--verbose] [--dry-run]
   [--no-sync] [--as NAME] [--room ROOM]...` -- wrap an agent CLI, tail its
   session log, and sync turn events. `--as NAME` is the session's owner /
   routing handle (others address it `@NAME`), uniquified on collision.

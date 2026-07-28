@@ -1,11 +1,11 @@
-"""Tests for the gemini adapter: session-shape fixtures → typed messages."""
+"""Tests for the Antigravity adapter: session-shape fixtures → typed messages."""
 
 from __future__ import annotations
 
 import json
 
+from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Event
-from trackinizer.trax.run.adapters.gemini import GeminiAdapter
 from trackinizer.types.agent_session_events import (
     AssistantMessage,
     Message,
@@ -31,12 +31,12 @@ def _parse_one(raw: bytes) -> Event | None:
     count to emit only newly-appended messages (REV-004), so a stale count
     from a prior single-body case must not bleed into the next.
     """
-    events = list(GeminiAdapter().parse(raw, whole_file=True))
+    events = list(AntigravityAdapter().parse(raw, whole_file=True))
     assert len(events) <= 1, events
     return events[0] if events else None
 
 
-class TestGeminiParseLine:
+class TestAntigravityParseLine:
     def test_empty_messages_is_skipped(self) -> None:
         line = _encode({"sessionId": "x", "messages": []})
         assert _parse_one(line) is None
@@ -63,13 +63,13 @@ class TestGeminiParseLine:
                 "sessionId": "x",
                 "messages": [
                     {"type": "user", "content": "hi"},
-                    {"type": "gemini", "content": "hi back"},
+                    {"type": "agy", "content": "hi back"},
                 ],
             }
         )
         # A fresh body's first parse emits every message in order (REV-004):
-        # the user prompt then the gemini reply.
-        events = list(GeminiAdapter().parse(line, whole_file=True))
+        # the user prompt then the agy reply.
+        events = list(AntigravityAdapter().parse(line, whole_file=True))
         assert isinstance(events[0].message, UserMessage)
         assert isinstance(events[1].message, AssistantMessage)
         assert events[1].message.text == "hi back"
@@ -80,7 +80,7 @@ class TestGeminiParseLine:
                 "sessionId": "x",
                 "messages": [
                     {
-                        "type": "gemini",
+                        "type": "agy",
                         "content": "running",
                         "toolCalls": [
                             {"id": "t1", "name": "read_file", "args": {"path": "x"}}
@@ -113,23 +113,23 @@ class TestGeminiParseLine:
         assert _parse_one(b"[1, 2, 3]") is None
 
     def test_is_whole_file_adapter(self) -> None:
-        """Gemini rewrites its session in place; it must declare whole-file."""
-        assert GeminiAdapter().whole_file is True
+        """Antigravity rewrites its session in place; it must declare whole-file."""
+        assert AntigravityAdapter().whole_file is True
 
     def test_parse_whole_file_emits_latest_message(self) -> None:
         line = _encode(
             {"sessionId": "x", "messages": [{"type": "user", "content": "hi"}]}
         )
-        events = list(GeminiAdapter().parse(line, whole_file=True))
+        events = list(AntigravityAdapter().parse(line, whole_file=True))
         assert len(events) == 1
         assert isinstance(events[0].message, UserMessage)
         assert events[0].message.text == "hi"
 
 
-class TestGeminiEmitsAppendedSlice:
+class TestAntigravityEmitsAppendedSlice:
     """Multiple messages appended between polls must all emit, in order.
 
-    REV-004/R-20: gemini rewrites its whole session JSON in place. The adapter
+    REV-004/R-20: agy rewrites its whole session JSON in place. The adapter
     emitted only ``messages[-1]`` per parse, so when N messages appeared
     between two polls (a burst, or a tool call + reply landing together) the
     N-1 earlier ones were dropped. The adapter must track the prior message
@@ -138,7 +138,7 @@ class TestGeminiEmitsAppendedSlice:
 
     def test_burst_of_new_messages_all_emit_in_order(self) -> None:
         # A fresh adapter (per-run state must not leak across runs).
-        fresh = GeminiAdapter()
+        fresh = AntigravityAdapter()
         first = _encode(
             {"sessionId": "x", "messages": [{"type": "user", "content": "q1"}]}
         )
@@ -152,9 +152,9 @@ class TestGeminiEmitsAppendedSlice:
                 "sessionId": "x",
                 "messages": [
                     {"type": "user", "content": "q1"},
-                    {"type": "gemini", "content": "a1"},
+                    {"type": "agy", "content": "a1"},
                     {"type": "user", "content": "q2"},
-                    {"type": "gemini", "content": "a2"},
+                    {"type": "agy", "content": "a2"},
                 ],
             }
         )
@@ -164,7 +164,7 @@ class TestGeminiEmitsAppendedSlice:
     def test_unchanged_message_list_emits_nothing(self) -> None:
         # A re-parse of an unchanged body (the runner can re-feed) emits no
         # duplicate: the prior count already covers every message.
-        fresh = GeminiAdapter()
+        fresh = AntigravityAdapter()
         body = _encode(
             {"sessionId": "x", "messages": [{"type": "user", "content": "only"}]}
         )
@@ -176,19 +176,19 @@ class TestGeminiEmitsAppendedSlice:
     def test_cursor_is_per_session_file_not_per_adapter(self) -> None:
         """One adapter draining several session files must not cross their cursors.
 
-        #498: the runner reuses ONE ``GeminiAdapter`` across every matching
+        #498: the runner reuses ONE ``AntigravityAdapter`` across every matching
         session file (``_scan_and_read``). A single ``_emitted`` counter then
         carried file A's count into file B: parsing B (2 msgs) yielded
         ``messages[2:] == []`` and B's turns were dropped. The cursor must be
         keyed per session file, so each file's appended slice is independent.
         """
-        adapter = GeminiAdapter()
+        adapter = AntigravityAdapter()
         file_a = _encode(
             {
                 "sessionId": "sess-A",
                 "messages": [
                     {"type": "user", "content": "a-q"},
-                    {"type": "gemini", "content": "a-r"},
+                    {"type": "agy", "content": "a-r"},
                 ],
             }
         )
@@ -197,7 +197,7 @@ class TestGeminiEmitsAppendedSlice:
                 "sessionId": "sess-B",
                 "messages": [
                     {"type": "user", "content": "b-q"},
-                    {"type": "gemini", "content": "b-r"},
+                    {"type": "agy", "content": "b-r"},
                 ],
             }
         )
@@ -215,7 +215,7 @@ class TestGeminiEmitsAppendedSlice:
         alternately as both grow. Each file must emit only its own newly-
         appended messages, never re-emit and never skip across the other file.
         """
-        adapter = GeminiAdapter()
+        adapter = AntigravityAdapter()
 
         def body(session: str, contents: list[str]) -> bytes:
             return _encode(
@@ -247,8 +247,8 @@ class TestGeminiEmitsAppendedSlice:
         first file's cursor and dropped. A keyless body must emit every message
         it carries rather than silently dropping turns.
         """
-        adapter = GeminiAdapter()
-        # Neither body carries a ``sessionId`` (malformed / pre-id gemini file).
+        adapter = AntigravityAdapter()
+        # Neither body carries a ``sessionId`` (malformed / pre-id agy file).
         file_a = _encode({"messages": [{"type": "user", "content": "a-only"}]})
         file_b = _encode({"messages": [{"type": "user", "content": "b-only"}]})
         events_a = [_text(e.message) for e in adapter.parse(file_a, whole_file=True)]

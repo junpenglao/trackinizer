@@ -1,8 +1,8 @@
-"""Gemini CLI adapter.
+"""Antigravity CLI adapter.
 
 Sessions live at
 ``~/.gemini/tmp/<project-sha256>/chats/session-<timestamp>-<uuid>.json``.
-Unlike the others, the session is one JSON object that gemini rewrites in
+Unlike the others, the session is one JSON object that agy rewrites in
 place on every update, so there are no appended lines to follow.
 
 The runner hands the whole file body to ``parse`` on each change (the adapter
@@ -31,24 +31,24 @@ from trackinizer.types.agent_session_events import (
 )
 
 
-class GeminiAdapter:
-    """Reads the ``gemini`` CLI's whole-file session JSON.
+class AntigravityAdapter:
+    """Reads the ``agy`` CLI's whole-file session JSON.
 
-    Stateful within one run: gemini rewrites its whole session JSON in place,
+    Stateful within one run: agy rewrites its whole session JSON in place,
     so the runner re-reads the entire body on each change. The adapter tracks
     how many messages it has already emitted, per session file, and emits only
     the newly-appended slice on the next parse, so a burst of N messages
     between two polls surfaces all N rather than only the last (REV-004).
 
-    The cursor is keyed by the body's ``sessionId`` (every gemini session file
+    The cursor is keyed by the body's ``sessionId`` (every agy session file
     stamps one), not a single counter: the runner reuses ONE adapter across
     every matching session file, so a per-adapter counter would carry one
     file's count into the next and drop the second file's turns (#498). Each
     run builds a fresh adapter, so the cursors never leak across runs.
     """
 
-    name: str = "gemini"
-    cli_binary: str = "gemini"
+    name: str = "agy"
+    cli_binary: str = "agy"
     whole_file: bool = True
 
     def __init__(self) -> None:
@@ -76,7 +76,7 @@ class GeminiAdapter:
         )
 
     def session_id_from_path(self, path: Path) -> str | None:
-        # Gemini's ``session-<id>.json`` stem carries an id, but resume
+        # Antigravity's ``session-<id>.json`` stem carries an id, but resume
         # correlation isn't wired for it yet; treat as non-resumable for now.
         del path
         return None
@@ -137,17 +137,17 @@ class GeminiAdapter:
 
 
 def _to_message(msg: JSON) -> Message | None:
-    """Normalize one gemini message to a typed message, or ``None`` to skip."""
+    """Normalize one agy message to a typed message, or ``None`` to skip."""
     msg_type = msg.get("type")
     if msg_type == "user":
         return UserMessage(text=_str(msg.get("content")))
-    if msg_type == "gemini":
+    if msg_type == "agy":
         return _assistant_message(msg)
     return UnknownMessage(raw=msg)
 
 
 def _assistant_message(msg: JSON) -> Message:
-    """A ``gemini`` message: response text plus any ``toolCalls`` entries."""
+    """An ``agy`` message: response text plus any ``toolCalls`` entries."""
     # Keyed by id (last-wins) so a duplicate ``toolCalls`` id cannot trip
     # ``AssistantMessage``'s duplicate-id invariant, which would raise and let
     # the runner silently drop the whole turn (mirrors claude's R-41 guard).
@@ -165,7 +165,7 @@ def _assistant_message(msg: JSON) -> Message:
 
 
 def _tool_calls(msg: JSON) -> tuple[JSON, ...]:
-    """The ``toolCalls`` array of a gemini message, or empty."""
+    """The ``toolCalls`` array of an agy message, or empty."""
     calls = msg.get("toolCalls")
     if not isinstance(calls, Sequence) or isinstance(calls, str):
         return ()

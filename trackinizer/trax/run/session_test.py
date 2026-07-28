@@ -22,8 +22,8 @@ import time
 import pytest
 
 from trackinizer.trax.run import session as session_mod
+from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
-from trackinizer.trax.run.adapters.gemini import GeminiAdapter
 from trackinizer.trax.run.session import (
     RunConfig,
     _drain_filesystem_loop,
@@ -105,7 +105,7 @@ class _FakeAdapter:
 class _WholeFileAdapter:
     """A whole-file adapter: the runner must feed it the entire file body.
 
-    Mirrors gemini, which rewrites one JSON object in place rather than
+    Mirrors Antigravity, which rewrites one JSON object in place rather than
     appending lines. ``parse`` reads ``messages[-1]`` from the whole body.
     """
 
@@ -268,7 +268,7 @@ class TestSessionScoping:
 
 
 class TestWholeFileDrain:
-    """A whole-file adapter (gemini) must receive the entire file, re-read."""
+    """A whole-file adapter (Antigravity) must receive the entire file, re-read."""
 
     def test_in_place_rewrite_emits_event(self, tmp_path: Path) -> None:
         log = tmp_path / "session-x.json"
@@ -287,7 +287,7 @@ class TestWholeFileDrain:
     def test_same_size_rewrite_emits_event(self, tmp_path: Path) -> None:
         """A whole-file rewrite to identical byte size still emits an event.
 
-        Gemini rewrites one JSON object in place; a same-length edit (the new
+        Antigravity rewrites one JSON object in place; a same-length edit (the new
         message has the same byte count as the old) keeps ``st_size``
         unchanged. Tracking size alone makes the second scan skip the re-read,
         dropping the new turn. The drain must detect the change via mtime or
@@ -338,13 +338,13 @@ class TestWholeFileDrain:
         ]
 
 
-class TestGeminiMultiFileDrain:
-    """One GeminiAdapter draining multiple session files keeps cursors apart.
+class TestAntigravityMultiFileDrain:
+    """One AntigravityAdapter draining multiple session files keeps cursors apart.
 
     #498: the runner reuses ONE adapter across every matching session file.
     A per-adapter message cursor carried one file's count into the next, so a
-    second gemini session file's turns were dropped. Drive the real adapter
-    through ``_scan_and_read`` over two on-disk gemini session files and assert
+    second agy session file's turns were dropped. Drive the real adapter
+    through ``_scan_and_read`` over two on-disk agy session files and assert
     every turn of both surfaces.
     """
 
@@ -370,10 +370,10 @@ class TestGeminiMultiFileDrain:
         _session("session-1.json", "sess-A", ["a-q", "a-r"])
         _session("session-2.json", "sess-B", ["b-q", "b-r"])
 
-        adapter = GeminiAdapter()  # ONE adapter for both files, like the runner
+        adapter = AntigravityAdapter()  # ONE adapter for both files, like the runner
         sink = _RecordingSink()
         stats = _Stats()
-        config = RunConfig(cli_name="gemini")
+        config = RunConfig(cli_name="agy")
         stamps: dict[Path, tuple[int, int]] = {}
         _scan_and_read(
             cast(Adapter, adapter),
@@ -617,7 +617,7 @@ class TestDryRunDrain:
     """The dry-run replay must dispatch each adapter by its drain shape."""
 
     def test_whole_file_adapter_emits_existing_body(self, tmp_path: Path) -> None:
-        """Dry-run on a whole-file (gemini) session re-reads and emits its turn.
+        """Dry-run on a whole-file (Antigravity) session re-reads and emits its turn.
 
         K3: dry-run used to feed every adapter through ``tail``'s line-split
         (``whole_file=False``), so a whole-file JSON body never parsed and no

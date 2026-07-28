@@ -292,7 +292,7 @@ trax run <cli> [--no-sync] [--out PATH] -- <cli args>
 ```
 
 ```
-adapters         claude, gemini, codex (file-tailers); codex_appserver (parser)
+adapters         claude, agy, codex (file-tailers); codex_appserver (parser)
 in-memory type   adapters.Event (one parsed turn) -> wire EventBody at the sink
 seq              harness-assigned, run-wide monotonic, per session
 server           resolved from the active trax profile (URL + auth)

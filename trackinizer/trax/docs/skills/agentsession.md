@@ -14,7 +14,7 @@ Per-kind expectations doc (SoT). Fields owned by `types/inquiries.py`; grammar b
 ## Completeness bar
 
 - **title** = what the session was for.
-- **cli** = the wrapped CLI (`claude`, `gemini`, `codex`, `cursor`).
+- **cli** = the wrapped CLI (`claude`, Antigravity's `agy`, `codex`, `cursor`).
 - **cli_session_id** = the CLI's own session id (for vendor correlation / dedup).
 - **started** / **ended** = session bounds (ISO). `ended` is written only by the
   atomic lifecycle moves (`end_session` / `_resume_session`), never a blind field

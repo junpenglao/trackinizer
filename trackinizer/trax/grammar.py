@@ -662,7 +662,7 @@ _FIELDS: tuple[Field, ...] = (
         cli_name="cli",
         payload_key="cli",
         shape="scalar",
-        help="wrapped CLI (claude/gemini/codex/cursor)",
+        help="wrapped CLI (claude/agy/codex/cursor)",
     ),
     Field(
         cli_name="cli_session_id",

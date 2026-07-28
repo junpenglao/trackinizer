@@ -5,10 +5,15 @@ Companion to `design_session_resume.md` (resume correlation) and
 `design_session_messaging.md` (send/rooms). Supersedes the deferred
 driver half of `trax/run/adapters/codex_appserver.py`.
 
+> **Historical terminology:** Gemini CLI was replaced by Antigravity CLI.
+> Gemini-specific observations below describe the retired implementation;
+> the active Google CLI adapter is `trax/run/adapters/antigravity.py` and its
+> command/provider identifier is `agy`.
+
 ## Problem
 
 `trax run` captures agent sessions by scraping each CLI's on-disk
-session log (`trax/run/adapters/{claude,codex,gemini}.py`) and injects
+session log (`trax/run/adapters/{claude,codex,antigravity}.py`) and injects
 `trax send` messages as bracketed pastes into a PTY
 (`trax/run/pty_pump.py`). Both halves work, but both are built on
 surfaces the vendors do not own as contracts:

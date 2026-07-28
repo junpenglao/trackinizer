@@ -42,7 +42,7 @@ its session log in parallel, emitting trackinizer-shaped events as
 JSONL. The wrapped CLI sees a real TTY and gets full passthrough --
 keystrokes, signals, exit code; the wrapper is invisible to it.
 
-Supported: `claude`, `gemini`, `codex`. Captured events sync to the
+Supported: `claude`, Antigravity (`agy`), and `codex`. Captured events sync to the
 Trackinizer server resolved from the active trax profile (URL plus
 auth) by default -- the same server every other `trax` verb talks to.
 `--no-sync` (or `--out PATH`, or `--dry-run`) captures to a local JSONL
@@ -50,7 +50,7 @@ file with no network instead.
 
 ```bash
 trax run claude -- "fix the failing test"                # sync to profile server
-trax run gemini --model gemini-3-pro -- "design a logger"
+trax run agy --model gemini-3-pro -- "design a logger"
 trax run codex --verbose -- "refactor the auth module"
 
 trax run codex --no-sync -- "your prompt"                # local JSONL, no network

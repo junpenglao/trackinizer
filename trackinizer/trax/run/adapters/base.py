@@ -51,17 +51,17 @@ class Adapter(Protocol):
     """One CLI's session-log dialect."""
 
     name: str
-    """Adapter identifier (``"claude"`` / ``"gemini"`` / ``"codex"``)."""
+    """Adapter identifier (``"claude"`` / ``"agy"`` / ``"codex"``)."""
 
     cli_binary: str
-    """The executable we exec (``"claude"`` / ``"gemini"`` / ``"codex"``)."""
+    """The executable we exec (``"claude"`` / ``"agy"`` / ``"codex"``)."""
 
     whole_file: bool
     """How the runner drains this adapter's session files.
 
     ``False`` (claude / codex): the log is append-only JSONL; the runner
     follows a byte offset and hands each new newline-terminated line to
-    :meth:`parse`. ``True`` (gemini): the CLI rewrites one JSON object in
+    :meth:`parse`. ``True`` (Antigravity): the CLI rewrites one JSON object in
     place, so the runner re-reads the whole file on each change and hands
     the entire body to :meth:`parse`.
     """

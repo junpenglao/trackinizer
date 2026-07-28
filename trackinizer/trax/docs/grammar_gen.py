@@ -479,7 +479,7 @@ def _semantics_block() -> str:
         "//   next=next unblocked Issue; blocked/board/graph=Issue views; search=text",
         "//   search; recent=audit feed; cost=cost rollup; id=show row by uuid;",
         "//   profile=manage server profiles; send=message a live agent session;",
-        "//   run=wrap an agent CLI (claude/gemini/codex) and sync its session.",
+        "//   run=wrap an agent CLI (claude/agy/codex) and sync its session.",
         *_verb_lines(),
     ]
     return "\n".join(lines)

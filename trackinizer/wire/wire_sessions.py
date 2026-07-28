@@ -101,7 +101,7 @@ class SessionStart(BaseModel):
     """
 
     cli: str = Field(min_length=1)
-    """Wrapped CLI: ``claude`` / ``gemini`` / ``codex`` / ``cursor``."""
+    """Wrapped CLI: ``claude`` / ``agy`` / ``codex`` / ``cursor``."""
 
     cli_session_id: str | None = Field(default=None, min_length=1)
     """The CLI's own session id, when known at start; may be backfilled via

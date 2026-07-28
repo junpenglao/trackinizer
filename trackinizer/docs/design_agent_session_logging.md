@@ -1,5 +1,9 @@
 # Agent session logging
 
+> **Historical terminology:** Gemini CLI references in this May 2026 design
+> describe the retired integration. The supported successor is Antigravity
+> CLI, invoked and stored under the provider identifier `agy`.
+
 ## Goal
 
 Let trackinizer record agent sessions at turn granularity so any session

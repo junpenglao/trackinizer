@@ -42,10 +42,10 @@ import time
 from trackinizer.client.client import Client
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
+from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
 from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
-from trackinizer.trax.run.adapters.gemini import GeminiAdapter
 from trackinizer.trax.run.pty_pump import PtyPump
 from trackinizer.trax.run.sink import (
     FileSink,
@@ -66,7 +66,7 @@ _logger = logging.getLogger(__name__)
 # into a second run in the same process (tests, a future supervisor).
 _ADAPTERS: dict[str, Callable[[], Adapter]] = {
     ClaudeAdapter.name: ClaudeAdapter,
-    GeminiAdapter.name: GeminiAdapter,
+    AntigravityAdapter.name: AntigravityAdapter,
     CodexAdapter.name: CodexAdapter,
 }
 
@@ -96,7 +96,7 @@ class RunConfig:
     """Settings for one ``trax run`` invocation."""
 
     cli_name: str
-    """``claude`` / ``gemini`` / ``codex``; selects the adapter."""
+    """``claude`` / ``agy`` / ``codex``; selects the adapter."""
 
     cli_args: tuple[str, ...] = ()
     """Passed verbatim to the wrapped CLI binary."""
@@ -671,7 +671,7 @@ def _drain_file(
 ) -> None:
     """Emit events for one file's new content, by the adapter's drain shape.
 
-    Whole-file adapters (gemini rewrites one JSON object in place) get the
+    Whole-file adapters (Antigravity rewrites one JSON object in place) get the
     entire body re-read on each change; line adapters (claude / codex append
     JSONL) follow a byte offset and emit per newline-terminated line.
     """
@@ -697,7 +697,7 @@ def _drain_whole_file(
     ``stamps`` records the last seen ``(size, mtime_ns)`` per file; an
     unchanged stamp skips the re-read so an idle file is not reparsed every
     poll. Tracking mtime alongside size is what catches a same-length rewrite
-    (a gemini in-place edit to identical byte size), which a size-only check
+    (an Antigravity in-place edit to identical byte size), which a size-only check
     would silently drop.
     """
     try:
@@ -805,7 +805,7 @@ def _dry_run_drain(
     """The ``--dry-run`` loop: replay existing session files until Ctrl-C.
 
     Polls the adapter's session dirs with the same per-shape dispatch as the
-    live drain (:func:`_scan_and_read`), so a whole-file adapter (gemini) is
+    live drain (:func:`_scan_and_read`), so a whole-file adapter (Antigravity) is
     re-read whole and a line adapter follows byte offsets -- unlike the old
     ``tail -F`` path, which line-split every adapter and so could never parse a
     whole-file JSON body. The baseline is empty (dry-run *replays* existing
