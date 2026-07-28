@@ -100,17 +100,48 @@ class TestAppendEvents:
 
     @pytest.mark.asyncio
     async def test_append_events_duplicate_batch_stays_silent(self) -> None:
-        """A fully-duplicate retry (appended == 0) emits no notification."""
+        """An identical fully-duplicate retry is skipped and stays silent."""
         conn = make_conn()
         store, engine = make_store(conn)
         session_id = uuid.uuid4()
         set_field_row(conn, {"kind": "AgentSession", "agentsession_ended": None})
         # Every row collided -> ON CONFLICT DO NOTHING RETURNING yields none.
         conn.fetch = AsyncMock(return_value=[])
+        # The persisted row is identical to the proposed event.
+        conn.fetchval = AsyncMock(return_value=None)
         appended, skipped = await store.append_events(
             session_id, [EventBody(seq=0, kind="UserMessage")]
         )
         assert (appended, skipped) == (0, 1)
+        assert engine.notify_calls == []
+        mismatch_sql, *mismatch_params = conn.fetchval.call_args.args
+        assert "IS DISTINCT FROM" in mismatch_sql
+        assert mismatch_params[0] == session_id
+        assert mismatch_params[1] == [0]
+
+    @pytest.mark.asyncio
+    async def test_append_events_rejects_divergent_same_seq_payload(self) -> None:
+        """A seq retry may deduplicate only when every stored field agrees."""
+        conn = make_conn()
+        store, engine = make_store(conn)
+        session_id = uuid.uuid4()
+        set_field_row(conn, {"kind": "AgentSession", "agentsession_ended": None})
+        # The INSERT collided, then the comparison query found seq 0 differs.
+        conn.fetch = AsyncMock(return_value=[])
+        conn.fetchval = AsyncMock(return_value=0)
+
+        with pytest.raises(ConflictError, match=r"seq 0.*different payload"):
+            await store.append_events(
+                session_id,
+                [
+                    EventBody(
+                        seq=0,
+                        kind="UserMessage",
+                        model="different-model",
+                    )
+                ],
+            )
+
         assert engine.notify_calls == []
 
     @pytest.mark.asyncio

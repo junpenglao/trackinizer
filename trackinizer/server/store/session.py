@@ -368,10 +368,13 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         path -- a forged body whose ``kind`` disagrees with its ``message``
         is rejected, not persisted.
 
-        ``PRIMARY KEY (session_id, seq)`` makes a retried batch a no-op:
-        ``ON CONFLICT DO NOTHING RETURNING`` reports exactly the rows this
-        call newly wrote, so ``appended`` and ``skipped`` are exact even
+        ``PRIMARY KEY (session_id, seq)`` makes an identical retried batch a
+        no-op: ``ON CONFLICT DO NOTHING RETURNING`` reports exactly the rows
+        this call newly wrote, so ``appended`` and ``skipped`` are exact even
         under a concurrent same-session appender (no count-subtraction race).
+        A colliding seq whose model, kind, timestamp, or message differs is not
+        a retry: it raises ``ConflictError`` and rolls back the whole batch
+        rather than silently discarding one writer's event.
 
         Raises:
           NotFoundError: ``session_id`` is not an existing inquiry.
@@ -461,11 +464,43 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
                 # that would leak the constraint name.
                 raise NotFoundError(f"session {session_id} not found") from exc
             appended = len(inserted)
+            skipped = len(events) - appended
+            if skipped:
+                # ``DO NOTHING`` alone cannot distinguish an identical retry
+                # from two writers assigning the same seq to different events.
+                # Compare in PostgreSQL so JSONB equality is structural and
+                # timestamptz equality is instant-based. This second statement
+                # sees this transaction's own inserts; checking every proposed
+                # row also catches divergent duplicate seqs within one batch.
+                divergent_seq = await conn.fetchval(
+                    "SELECT proposed.seq FROM unnest("
+                    "$2::int[], $3::text[], $4::text[], "
+                    "$5::timestamptz[], $6::jsonb[]) "
+                    "AS proposed(seq, model, kind, timestamp, message) "
+                    "JOIN agent_session_events stored "
+                    "ON stored.session_id = $1 AND stored.seq = proposed.seq "
+                    "WHERE stored.model IS DISTINCT FROM proposed.model "
+                    "OR stored.kind IS DISTINCT FROM proposed.kind "
+                    "OR stored.timestamp IS DISTINCT FROM proposed.timestamp "
+                    "OR stored.message IS DISTINCT FROM proposed.message "
+                    "LIMIT 1",
+                    session_id,
+                    [r[1] for r in rows],
+                    [r[2] for r in rows],
+                    [r[3] for r in rows],
+                    [r[4] for r in rows],
+                    [r[5] for r in rows],
+                )
+                if divergent_seq is not None:
+                    raise ConflictError(
+                        f"session {session_id} event seq {divergent_seq} "
+                        "already exists with a different payload"
+                    )
             # Only a real append wakes subscribers: a fully-duplicate retry
             # (appended == 0) is a no-op and must stay silent.
             if appended:
                 self._buffer_notification(session_id)
-        return (appended, len(events) - appended)
+        return (appended, skipped)
 
     async def read_session_events(
         self,

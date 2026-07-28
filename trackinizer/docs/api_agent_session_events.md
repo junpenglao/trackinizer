@@ -94,7 +94,8 @@ idx_agent_session_events_kind   (kind)
 
 ```
 append-only           no UPDATE; events never edited/superseded/cited
-dedup key             (session_id, seq); re-append is ON CONFLICT DO NOTHING
+dedup key             (session_id, seq); identical re-appends are skipped;
+                      a different payload at the same seq is a 409 conflict
 adjacent universe     deliberately outside change_log; events are not Change
                       rows by design (see design.md "Everything is provenance"):
                       a captured turn is not a knowledge mutation. Provenance
@@ -210,8 +211,8 @@ POST /api/sessions/<id>/end        writer  SessionEnd            SessionEndRespo
 
 ```
 start            mints an AgentSession row (server id); dedups on idempotency_key
-events           batch append; ON CONFLICT (session_id, seq) DO NOTHING;
-                 appended = rows newly written, skipped = collisions
+events           batch append; identical (session_id, seq) retries are skipped;
+                 a divergent collision rolls back the batch with 409
 end              backfills ended/cli_session_id; sets status=complete
 unknown session  any <id> not an AgentSession row -> 404
 ```
