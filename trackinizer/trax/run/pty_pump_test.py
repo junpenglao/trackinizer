@@ -26,6 +26,116 @@ if TYPE_CHECKING:
     import pytest
 
 
+_TERMINATION_CHILD = """
+import fcntl
+import os
+import signal
+import sys
+import time
+
+mode, ready, descendant_ready, descendant_pid, lock_path = sys.argv[1:]
+if mode == "solo":
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(ready, "w").close()
+    time.sleep(2)
+    raise SystemExit
+
+if os.fork() == 0:
+    if mode == "detached":
+        os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    lock = open(lock_path, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    open(descendant_pid, "w").write(str(os.getpid()))
+    open(descendant_ready, "w").close()
+    time.sleep(30)
+    os._exit(0)
+
+deadline = time.monotonic() + 1
+while not os.path.exists(descendant_ready) and time.monotonic() < deadline:
+    time.sleep(0.005)
+if not os.path.exists(descendant_ready):
+    os._exit(2)
+if mode == "detached":
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(ready, "w").close()
+time.sleep(30)
+"""
+
+
+def _termination_case(tmp_path: Path, mode: str) -> tuple[PtyPump, Path, Path, Path]:
+    ready = tmp_path / "ready"
+    descendant_ready = tmp_path / "descendant-ready"
+    descendant_pid = tmp_path / "descendant-pid"
+    lock_path = tmp_path / "descendant.lock"
+    pump = PtyPump(
+        [
+            sys.executable,
+            "-c",
+            _TERMINATION_CHILD,
+            mode,
+            str(ready),
+            str(descendant_ready),
+            str(descendant_pid),
+            str(lock_path),
+        ]
+    )
+    return pump, ready, descendant_pid, lock_path
+
+
+def _run_terminated(pump: PtyPump, ready: Path) -> tuple[int, float]:
+    ready_seen = threading.Event()
+
+    def terminate_when_ready() -> None:
+        deadline = time.monotonic() + 1.0
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if ready.exists():
+            ready_seen.set()
+        pump.terminate()
+
+    terminator = threading.Thread(target=terminate_when_ready)
+    started = time.monotonic()
+    try:
+        returncode = pump.run(on_started=terminator.start)
+    finally:
+        terminator.join(timeout=2.0)
+    assert ready_seen.is_set()
+    return returncode, time.monotonic() - started
+
+
+def _lock_is_available(path: Path) -> bool:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _wait_for_lock(path: Path) -> bool:
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        if _lock_is_available(path):
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def _kill_test_process(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def _ignore_group(_pgid: int, _signum: int) -> None:
+    pass
+
+
 class TestEncodeInjection:
     def test_wraps_in_bracketed_paste_without_enter(self) -> None:
         out = encode_injection("hello")
@@ -498,7 +608,12 @@ class TestPtyPumpLifecycle:
             property(lambda _pump: next(pid_reads)),
             raising=False,
         )
-        monkeypatch.setattr(os, "kill", lambda pid, _signal: observed.append(pid))
+
+        def observe_pid(pid: int, _signum: int) -> None:
+            observed.append(pid)
+
+        monkeypatch.setattr(os, "kill", observe_pid)
+        monkeypatch.setattr(os, "killpg", _ignore_group)
 
         pump.terminate()
 
@@ -508,6 +623,7 @@ class TestPtyPumpLifecycle:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A child cannot be reaped and recycled during its signal syscall."""
+        monkeypatch.setattr(pty_pump, "_TERMINATE_GRACE_SEC", 0.0)
         pump = PtyPump(["unused"])
         child_pid = 42_424
         with pump._child_lock:
@@ -531,15 +647,17 @@ class TestPtyPumpLifecycle:
 
         def record_kill(pid: int, signum: int) -> None:
             assert pump._child_lock.locked()
-            reaper = threading.Thread(target=reap)
-            reapers.append(reaper)
-            reaper.start()
-            assert reaper_started.wait(2.0)
-            assert not waitpid_entered.is_set()
+            if signum == signal.SIGTERM:
+                reaper = threading.Thread(target=reap)
+                reapers.append(reaper)
+                reaper.start()
+                assert reaper_started.wait(2.0)
+                assert not waitpid_entered.is_set()
             signals.append((pid, signum))
 
         monkeypatch.setattr(os, "waitpid", controlled_waitpid)
         monkeypatch.setattr(os, "kill", record_kill)
+        monkeypatch.setattr(os, "killpg", _ignore_group)
 
         pump.terminate()
 
@@ -547,7 +665,10 @@ class TestPtyPumpLifecycle:
         reapers[0].join(timeout=2.0)
         assert not reapers[0].is_alive()
         assert waitpid_entered.is_set()
-        assert signals == [(child_pid, signal.SIGTERM)]
+        assert signals == [
+            (child_pid, signal.SIGTERM),
+            (child_pid, signal.SIGKILL),
+        ]
         assert result == [0]
         assert pump._pid == -1
 
@@ -555,6 +676,7 @@ class TestPtyPumpLifecycle:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A live child remains terminable after closing its PTY."""
+        monkeypatch.setattr(pty_pump, "_TERMINATE_GRACE_SEC", 0.0)
         pump = PtyPump(["unused"])
         child_pid = 42_424
         with pump._child_lock:
@@ -579,8 +701,12 @@ class TestPtyPumpLifecycle:
             paused.set()
             assert resume.wait(2.0)
 
+        def record_pid(pid: int, _signum: int) -> None:
+            signals.append(pid)
+
         monkeypatch.setattr(os, "waitpid", controlled_waitpid)
-        monkeypatch.setattr(os, "kill", lambda pid, _signal: signals.append(pid))
+        monkeypatch.setattr(os, "kill", record_pid)
+        monkeypatch.setattr(os, "killpg", _ignore_group)
         monkeypatch.setattr(time, "sleep", pause_between_polls)
         reaper = threading.Thread(target=lambda: result.append(pump._reap()))
         reaper.start()
@@ -594,8 +720,92 @@ class TestPtyPumpLifecycle:
             reaper.join(timeout=2.0)
 
         assert not reaper.is_alive()
-        assert signals == [child_pid]
+        assert signals == [child_pid, child_pid]
         assert result == [0]
+
+    def test_escalation_kills_owned_pid_when_process_group_is_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pty_pump, "_TERMINATE_GRACE_SEC", 0.02)
+        pump, ready, _, _ = _termination_case(tmp_path, "solo")
+
+        def missing_group(_pgid: int, _signum: int) -> None:
+            raise ProcessLookupError
+
+        monkeypatch.setattr(os, "killpg", missing_group)
+        returncode, elapsed = _run_terminated(pump, ready)
+
+        assert returncode == 128 + signal.SIGKILL
+        assert elapsed < 0.25
+        assert pump._pid == -1
+
+    def test_reap_honors_grace_then_escalates_before_waitpid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pump = PtyPump(["unused"])
+        child_pid = 42_424
+        now = [0.0]
+        trace: list[str] = []
+        with pump._child_lock:
+            pump._pid = child_pid
+            pump._terminate_pgid = child_pid
+            pump._terminate_deadline = 1.0
+
+        def advance_clock(_seconds: float) -> None:
+            assert not trace
+            trace.append("grace")
+            now[0] = 2.0
+
+        def waitpid(pid: int, options: int) -> tuple[int, int]:
+            assert (pid, options) == (child_pid, os.WNOHANG)
+            trace.append("waitpid")
+            return pid, signal.SIGTERM
+
+        def record_pid(_pid: int, _signum: int) -> None:
+            trace.append("kill-pid")
+
+        def record_group(_pgid: int, _signum: int) -> None:
+            trace.append("kill-pgid")
+
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(time, "sleep", advance_clock)
+        monkeypatch.setattr(os, "waitpid", waitpid)
+        monkeypatch.setattr(os, "kill", record_pid)
+        monkeypatch.setattr(os, "killpg", record_group)
+
+        assert pump._reap() == 128 + signal.SIGTERM
+        assert trace == ["grace", "kill-pid", "kill-pgid", "waitpid"]
+        assert pump._pid == -1
+
+    def test_escalation_kills_stubborn_process_group_descendant(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pty_pump, "_TERMINATE_GRACE_SEC", 0.05)
+        pump, ready, descendant_pid, lock_path = _termination_case(tmp_path, "group")
+        returncode, elapsed = _run_terminated(pump, ready)
+        pid = int(descendant_pid.read_text())
+        try:
+            assert returncode == 128 + signal.SIGTERM
+            assert elapsed < 0.3
+            assert _wait_for_lock(lock_path)
+        finally:
+            _kill_test_process(pid)
+
+    def test_terminate_stops_waiting_for_detached_pty_holder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pty_pump, "_TERMINATE_GRACE_SEC", 0.02)
+        pump, ready, detached_pid, lock_path = _termination_case(tmp_path, "detached")
+        returncode, elapsed = _run_terminated(pump, ready)
+        pid = int(detached_pid.read_text())
+        try:
+            assert returncode == 128 + signal.SIGKILL
+            assert elapsed < 0.25
+            assert not _lock_is_available(lock_path)
+            os.kill(pid, 0)
+        finally:
+            _kill_test_process(pid)
+        assert pump._pid == -1
 
     def test_setup_failure_after_fork_reaps_the_child(
         self, monkeypatch: pytest.MonkeyPatch

@@ -55,6 +55,7 @@ _PASTE_START: Final = b"\x1b[200~"
 _PASTE_END: Final = b"\x1b[201~"
 
 _SUBMIT: Final = b"\r"
+_TERMINATE_GRACE_SEC: Final = 0.5
 
 # Fallback PTY size (rows, cols) when the wrapper's stdin carries none (piped
 # or redirected). A 0x0 PTY makes child TUIs render one char per line and
@@ -122,6 +123,8 @@ class PtyPump:
         # through kill/waitpid prevents both kill(-1) and stale recycled-PID
         # signals when a drain worker terminates the child.
         self._child_lock = threading.Lock()
+        self._terminate_deadline: float | None = None
+        self._terminate_pgid: int | None = None
         # The child's exit status once ``_child_alive`` reaps it via WNOHANG,
         # else None. Without this, that early reap would leave ``_reap`` with
         # no child and it would report 0, losing the real exit code when stdin
@@ -187,13 +190,19 @@ class PtyPump:
             return self._injected
 
     def terminate(self) -> None:
-        """Signal the child to exit (SIGTERM); safe to call repeatedly."""
+        """Request child exit, escalating an ignored SIGTERM to SIGKILL."""
         with self._child_lock:
             pid = self._pid
             if pid <= 0:
                 return
+            first_request = self._terminate_pgid is None
+            self._terminate_pgid = pid
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGTERM)
+            if first_request:
+                self._terminate_deadline = time.monotonic() + _TERMINATE_GRACE_SEC
 
     def run(self, *, on_started: Callable[[], None] | None = None) -> int:
         """Spawn the child and pump until it exits; return its exit status.
@@ -219,6 +228,8 @@ class PtyPump:
         with self._child_lock:
             self._pid = pid
             self._exit_status = None
+            self._terminate_deadline = None
+            self._terminate_pgid = None
         self._master_fd = master_fd
         # From here the child is forked and exec'd onto the PTY slave; any raise
         # in terminal setup (winsize, raw mode, SIGWINCH) before or during the
@@ -259,6 +270,7 @@ class PtyPump:
         on the caller's thread, so this loop only mirrors I/O.
         """
         while True:
+            termination_escalated = self._escalate_termination()
             watch = [fd for fd in (stdin_fd, self._master_fd) if fd >= 0]
             try:
                 readable, _, _ = select.select(watch, [], [], poll_sec)
@@ -274,6 +286,8 @@ class PtyPump:
                 self._master_fd, out_fd
             ):
                 break  # Child closed its side: it has exited.
+            if termination_escalated and not self._child_alive():
+                break
             if stdin_fd < 0 and not self._child_alive():
                 break
         return self._reap()
@@ -335,17 +349,26 @@ class PtyPump:
         when stdin closes before the child.
         """
         with self._child_lock:
+            self._escalate_termination_locked()
             if self._pid <= 0:
+                self._terminate_deadline = None
+                self._terminate_pgid = None
                 return False
+            if self._terminate_deadline is not None:
+                return True
             try:
                 pid, status = os.waitpid(self._pid, os.WNOHANG)
             except ChildProcessError:
                 self._pid = -1
+                self._terminate_deadline = None
+                self._terminate_pgid = None
                 return False
             if pid == 0:
                 return True
             self._exit_status = status
             self._pid = -1
+            self._terminate_deadline = None
+            self._terminate_pgid = None
             return False
 
     def _reap(self) -> int:
@@ -363,20 +386,24 @@ class PtyPump:
         poll_sec = 0.0
         while True:
             with self._child_lock:
+                self._escalate_termination_locked()
                 status = self._exit_status
                 if status is not None:
                     break
                 if self._pid <= 0:
                     return 0
-                try:
-                    pid, status = os.waitpid(self._pid, os.WNOHANG)
-                except ChildProcessError:
-                    self._pid = -1
-                    return 0
-                if pid != 0:
-                    self._exit_status = status
-                    self._pid = -1
-                    break
+                if self._terminate_deadline is None:
+                    try:
+                        pid, status = os.waitpid(self._pid, os.WNOHANG)
+                    except ChildProcessError:
+                        self._pid = -1
+                        self._terminate_pgid = None
+                        return 0
+                    if pid != 0:
+                        self._exit_status = status
+                        self._pid = -1
+                        self._terminate_pgid = None
+                        break
             time.sleep(poll_sec)
             poll_sec = min(0.01, max(0.0001, poll_sec * 2))
         if os.WIFSIGNALED(status):
@@ -387,6 +414,27 @@ class PtyPump:
         """Whether this pump still owns a signalable, unreaped child."""
         with self._child_lock:
             return self._pid > 0
+
+    def _escalate_termination(self) -> bool:
+        """Kill a child that outlived its graceful termination window."""
+        with self._child_lock:
+            self._escalate_termination_locked()
+            return self._terminate_pgid is not None and self._terminate_deadline is None
+
+    def _escalate_termination_locked(self) -> None:
+        deadline = self._terminate_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self._kill_termination_group_locked()
+
+    def _kill_termination_group_locked(self) -> None:
+        self._terminate_deadline = None
+        if self._pid > 0:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self._pid, signal.SIGKILL)
+        if self._terminate_pgid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self._terminate_pgid, signal.SIGKILL)
 
 
 def _write_all_fd(fd: int, data: bytes) -> bool:
