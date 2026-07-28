@@ -698,7 +698,9 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         Raises:
           NotFoundError: ``session_id`` is not an existing inquiry.
           ConflictError: the row is not an ``AgentSession``, or it is already
-            ended by a *different* idempotency key (a genuine second close).
+            ended by a *different* idempotency key (a genuine second close),
+            or ``cli_session_id`` attempts to replace an identity already
+            confirmed for the row.
 
         """
         # The only legal terminal status for an ended AgentSession; the
@@ -760,10 +762,10 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
                 raise ConflictError(
                     f"session {session_id} has already ended; cannot end again"
                 )
-            if (
-                cli_session_id is not None
-                and cli_session_id != row["agentsession_cli_session_id"]
-            ):
+            stored_cli_session_id = cast(
+                "str | None", row["agentsession_cli_session_id"]
+            )
+            if cli_session_id is not None and stored_cli_session_id is None:
                 await self._update_field(
                     conn, session_id, "agentsession_cli_session_id", cli_session_id
                 )
@@ -772,14 +774,17 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
                     session_id,
                     "AgentSession",
                     "agentsession_cli_session_id",
-                    Snapshot(
-                        agentsession_cli_session_id=cast(
-                            "str | None", row["agentsession_cli_session_id"]
-                        )
-                    ),
+                    Snapshot(agentsession_cli_session_id=stored_cli_session_id),
                     new=Snapshot(agentsession_cli_session_id=cli_session_id),
                     api_key_id=api_key_id,
                     actor=actor,
+                )
+            elif cli_session_id is not None and cli_session_id != stored_cli_session_id:
+                set_client_change_id(None)
+                raise ConflictError(
+                    f"session {session_id} is bound to native session "
+                    f"{stored_cli_session_id!r}; cannot replace it with "
+                    f"{cli_session_id!r}"
                 )
             # Stamp ``ended`` and ``status`` in ONE statement: the lifecycle
             # CHECK (``ended`` set iff ``status='complete'``) is evaluated per

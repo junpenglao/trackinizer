@@ -213,7 +213,8 @@ POST /api/sessions/<id>/end        writer  SessionEnd            SessionEndRespo
 start            mints an AgentSession row (server id); dedups on idempotency_key
 events           batch append; identical (session_id, seq) retries are skipped;
                  a divergent collision rolls back the batch with 409
-end              backfills ended/cli_session_id; sets status=complete
+end              fills a missing cli_session_id but rejects replacement;
+                 sets ended and status=complete
 unknown session  any <id> not an AgentSession row -> 404
 ```
 

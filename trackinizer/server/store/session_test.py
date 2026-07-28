@@ -305,6 +305,48 @@ class TestEndSession:
         )
 
     @pytest.mark.asyncio
+    async def test_end_only_backfills_a_missing_native_session_id(self) -> None:
+        conn = make_conn()
+        set_field_row(conn, self._live_row())
+        store, _engine = make_store(conn)
+
+        await store.end_session(
+            new_uuid(),
+            ended=datetime(2026, 1, 1, tzinfo=UTC),
+            cli_session_id="provider-confirmed",
+            actor="user",
+        )
+
+        writes = [
+            call.args
+            for call in conn.execute.call_args_list
+            if call.args
+            and "UPDATE inquiries SET agentsession_cli_session_id" in call.args[0]
+        ]
+        assert len(writes) == 1
+        assert writes[0][1] == "provider-confirmed"
+
+    @pytest.mark.asyncio
+    async def test_end_rejects_replacing_a_bound_native_session_id(self) -> None:
+        conn = make_conn()
+        set_field_row(conn, self._live_row("already-confirmed"))
+        store, _engine = make_store(conn)
+
+        with pytest.raises(ConflictError, match="cannot replace"):
+            await store.end_session(
+                new_uuid(),
+                ended=datetime(2026, 1, 1, tzinfo=UTC),
+                cli_session_id="different-id",
+                actor="user",
+            )
+
+        assert not any(
+            "UPDATE inquiries SET agentsession_cli_session_id" in call.args[0]
+            or "UPDATE inquiries SET agentsession_ended" in call.args[0]
+            for call in conn.execute.call_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_status_failure_rolls_back_ended(self) -> None:
         # If the status write fails mid-close, the surrounding tx must
         # ROLLBACK so ``ended`` is not persisted -- the atomicity invariant
