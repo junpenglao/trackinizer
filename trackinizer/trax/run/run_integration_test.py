@@ -487,6 +487,12 @@ class _LineAdapter:
         del path
         return None
 
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        del path, first_record
+        return None
+
     def parse(self, raw: bytes) -> Iterator[Event]:
         yield Event(message=UserMessage(text=raw.decode()))
 

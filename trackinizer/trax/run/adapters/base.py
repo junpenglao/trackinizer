@@ -82,6 +82,17 @@ class Adapter(Protocol):
         """
         ...
 
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        """Corroborate native identity using bytes read from the owned file.
+
+        ``session_id_from_path`` supports broad offline replay. Exact live
+        binding uses this method so an adapter never has to reopen a pathname
+        after the runner has safely opened and retained its descriptor.
+        """
+        ...
+
     def parse(self, raw: bytes) -> Iterable[Event]:
         """Translate one appended JSONL record into zero or more ``Event``s.
 

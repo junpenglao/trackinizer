@@ -93,10 +93,21 @@ class CodexAdapter:
         ambiguous and therefore fail closed rather than correlating the run to
         the wrong AgentSession.
         """
+        try:
+            with path.open("rb") as source:
+                first_record = source.readline()
+        except OSError:
+            first_record = None
+        return self.session_id_from_transcript(path, first_record)
+
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        """Corroborate filename and metadata without reopening an owned path."""
         if path.suffix != ".jsonl" or not path.name.startswith("rollout-"):
             return None
         filename_id = _session_id_from_filename(path)
-        metadata_id = _session_id_from_metadata(path)
+        metadata_id = _session_id_from_metadata(first_record)
         if (
             filename_id is not None
             and metadata_id is not None
@@ -135,12 +146,9 @@ def _session_id_from_filename(path: Path) -> str | None:
     return _canonical_uuid(stem[-36:])
 
 
-def _session_id_from_metadata(path: Path) -> str | None:
-    """Read the native id from the first, ``session_meta``, JSONL record."""
-    try:
-        with path.open("rb") as source:
-            raw = source.readline()
-    except OSError:
+def _session_id_from_metadata(raw: bytes | None) -> str | None:
+    """Read the native id from a held transcript's first JSONL record."""
+    if raw is None:
         return None
     try:
         parsed = json.loads(raw)

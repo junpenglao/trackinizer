@@ -91,6 +91,13 @@ class ClaudeAdapter:
             return None
         return path.stem or None
 
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        """Corroborate the held transcript; Claude's UUID is in its filename."""
+        del first_record
+        return self.session_id_from_path(path)
+
     def parse(self, raw: bytes) -> Iterable[Event]:
         try:
             parsed = json.loads(raw)

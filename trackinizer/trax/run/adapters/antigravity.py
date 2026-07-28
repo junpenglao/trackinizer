@@ -76,6 +76,13 @@ class AntigravityAdapter:
         """Return the exact native Antigravity conversation UUID in ``path``."""
         return self._conversation_id_from_path(path)
 
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        """Corroborate the held transcript; its UUID is in the directory path."""
+        del first_record
+        return self.session_id_from_path(path)
+
     def _conversation_id_from_path(self, path: Path) -> str | None:
         """Validate the full transcript path and extract its canonical UUID."""
         try:

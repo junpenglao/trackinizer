@@ -97,6 +97,12 @@ class _FakeAdapter:
         del path
         return None
 
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        del path, first_record
+        return None
+
     def parse(self, raw: bytes) -> Iterable[Event]:
         return (Event(message=UserMessage(text=raw.decode())),)
 
@@ -118,6 +124,12 @@ class _PoisonAdapter:
 
     def session_id_from_path(self, path: Path) -> str | None:
         del path
+        return None
+
+    def session_id_from_transcript(
+        self, path: Path, first_record: bytes | None
+    ) -> str | None:
+        del path, first_record
         return None
 
     def parse(self, raw: bytes) -> Iterable[Event]:
