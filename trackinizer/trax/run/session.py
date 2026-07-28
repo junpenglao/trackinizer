@@ -9,8 +9,8 @@ Three things run side by side:
    not literally inherited fds).
 
 2. A drain thread that emits events from the wrapped process's transcript.
-   Antigravity is bound to one exact, provider-proven file; adapters without
-   an exact binding still use the legacy scoped directory scanner.
+   Antigravity and explicit Codex resumes bind one exact, provider-proven
+   file; other launches still use the legacy scoped directory scanner.
 
 3. When syncing, an inbound-poll thread that drains server-queued messages
    and injects them into the CLI via the pump.
@@ -29,7 +29,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 import argparse
 import logging
@@ -46,11 +46,9 @@ from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
 from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
-from trackinizer.trax.run.antigravity_binding import (
-    PreparedAntigravity,
-    prepare_antigravity,
-)
+from trackinizer.trax.run.antigravity_binding import prepare_antigravity
 from trackinizer.trax.run.pty_pump import PtyPump
+from trackinizer.trax.run.resume_binding import prepare_explicit_resume
 from trackinizer.trax.run.sink import (
     FileSink,
     LockedSink,
@@ -64,6 +62,22 @@ from trackinizer.types.agent_session_events import SlashCommand
 
 
 _logger = logging.getLogger(__name__)
+
+
+class _PreparedTranscript(Protocol):
+    """One provider-owned transcript binding prepared before child launch."""
+
+    @property
+    def cli_args(self) -> tuple[str, ...]: ...
+
+    @property
+    def expected_cli_session_id(self) -> str | None: ...
+
+    def poll(self) -> TranscriptReader | None: ...
+
+    def finish(self) -> TranscriptReader: ...
+
+    def close(self) -> None: ...
 
 
 # Adapter *factories*, not singletons: each run builds a fresh adapter so
@@ -247,14 +261,13 @@ def _spawn_and_drain(
     if shutil.which(adapter.cli_binary) is None:
         raise SystemExit(f"trax run: {adapter.cli_binary} not found in PATH")
 
-    exact_adapter = adapter if isinstance(adapter, AntigravityAdapter) else None
-    prepared = (
-        prepare_antigravity(exact_adapter, config.cli_args, cwd=Path.cwd())
-        if exact_adapter is not None
-        else None
-    )
-    # Claude/Codex retain the legacy scoped scanner until their provider proof
-    # seams land. Antigravity must never enumerate its shared archive.
+    prepared: _PreparedTranscript | None
+    if isinstance(adapter, AntigravityAdapter):
+        prepared = prepare_antigravity(adapter, config.cli_args, cwd=Path.cwd())
+    else:
+        prepared = prepare_explicit_resume(adapter, config.cli_args, cwd=Path.cwd())
+    # Fresh Claude/Codex launches retain the legacy scoped scanner until their
+    # provider proof seams land. Exact bindings never enumerate shared archives.
     legacy_capture = (
         (_existing_session_files(adapter), time.time()) if prepared is None else None
     )
@@ -298,7 +311,6 @@ def _spawn_and_drain(
                 )
 
         else:
-            assert exact_adapter is not None
 
             def fail_exact_drain(err: Exception) -> None:
                 drain_errors.append(err)
@@ -308,8 +320,8 @@ def _spawn_and_drain(
 
             def drain() -> None:
                 try:
-                    _drain_antigravity_loop(
-                        exact_adapter,
+                    _drain_exact_loop(
+                        adapter,
                         prepared,
                         sink,
                         stats,
@@ -375,9 +387,9 @@ def _spawn_and_drain(
             prepared.close()
 
 
-def _drain_antigravity_loop(
-    adapter: AntigravityAdapter,
-    prepared: PreparedAntigravity,
+def _drain_exact_loop(
+    adapter: Adapter,
+    prepared: _PreparedTranscript,
     sink: Sink,
     stats: _Stats,
     config: RunConfig,
@@ -387,7 +399,7 @@ def _drain_antigravity_loop(
     binding_ready: threading.Event | None = None,
     poll_interval: float = 0.2,
 ) -> None:
-    """Drain only the transcript proven by this Antigravity process."""
+    """Drain only the transcript proven for this provider process."""
     reader: TranscriptReader | None = None
     native_id_set = prepared.expected_cli_session_id is not None
 
@@ -397,7 +409,7 @@ def _drain_antigravity_loop(
         if observed is None:
             return reader
         if reader is not None and observed is not reader:
-            raise RuntimeError("Antigravity binding changed transcript reader")
+            raise RuntimeError("exact binding changed transcript reader")
         if reader is None:
             reader = observed
             if not native_id_set:

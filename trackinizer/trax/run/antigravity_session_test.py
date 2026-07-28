@@ -18,9 +18,11 @@ import pytest
 from trackinizer.client.client import Client
 from trackinizer.trax.run import session as session_mod
 from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
-from trackinizer.trax.run.adapters.base import Event
+from trackinizer.trax.run.adapters.base import Adapter, Event
+from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.antigravity_binding import PreparedAntigravity
 from trackinizer.trax.run.pty_pump import PtyPump
+from trackinizer.trax.run.resume_binding import PreparedResume
 from trackinizer.trax.run.session import RunConfig, _Stats
 from trackinizer.types.agent_session_events import SlashCommand, UserMessage
 
@@ -38,6 +40,16 @@ class _Adapter(AntigravityAdapter):
     @override
     def session_dirs(self) -> Iterable[Path]:
         raise AssertionError("exact capture must not enumerate archives")
+
+    @override
+    def parse(self, raw: bytes) -> Iterable[Event]:
+        return (Event(message=UserMessage(text=raw.decode())),)
+
+
+class _Codex(CodexAdapter):
+    @override
+    def session_dirs(self) -> Iterable[Path]:
+        raise AssertionError("explicit resume must not scan provider archives")
 
     @override
     def parse(self, raw: bytes) -> Iterable[Event]:
@@ -255,7 +267,7 @@ def _install(
 
 def _run(
     sink: _Sink,
-    adapter: AntigravityAdapter | None = None,
+    adapter: Adapter | None = None,
     config: RunConfig = _CONFIG,
 ) -> int:
     return session_mod._spawn_and_drain(config, adapter or _Adapter(), sink, _Stats())
@@ -273,6 +285,59 @@ def test_resume_prebinds_identity_and_drains_owned_suffix(
     assert sink.calls == [("set", _ID), ("open", None), ("emit", "new")]
     assert argv == ["agy", *prepared.cli_args]
     assert prepared.finish_calls == 1
+    assert prepared.closed
+
+
+def test_codex_resume_dispatches_to_exact_prebound_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _Codex()
+    args = ("resume", _ID)
+    config = RunConfig(
+        cli_name="codex",
+        cli_args=args,
+        sync=False,
+        quiesce_seconds=0.0,
+    )
+    reader = _Reader(b"new")
+    prepared = _Prepared(reader, expected_id=_ID)
+    prepared.cli_args = args
+    sink = _Sink()
+    captured_argv: list[str] = []
+
+    def prepare(
+        actual_adapter: Adapter,
+        actual_args: Sequence[str],
+        *,
+        cwd: Path,
+    ) -> PreparedResume:
+        assert actual_adapter is adapter
+        assert tuple(actual_args) == args
+        assert cwd == Path.cwd()
+        return cast(PreparedResume, prepared)
+
+    class _Pump:
+        def __init__(self, argv: list[str], **_kwargs: object) -> None:
+            captured_argv.extend(argv)
+
+        def run(self, *, on_started: Callable[[], None] | None = None) -> int:
+            assert on_started is not None
+            on_started()
+            assert sink.emitted.wait(1.0)
+            return 23
+
+    monkeypatch.setattr(session_mod, "prepare_explicit_resume", prepare)
+    monkeypatch.setattr(session_mod, "_existing_session_files", _forbid_enumeration)
+    monkeypatch.setattr(session_mod, "PtyPump", _Pump)
+
+    def found_binary(_binary: str) -> str:
+        return "/bin/codex"
+
+    monkeypatch.setattr(shutil, "which", found_binary)
+
+    assert _run(sink, adapter, config) == 23
+    assert sink.calls == [("set", _ID), ("open", None), ("emit", "new")]
+    assert captured_argv == ["codex", *args]
     assert prepared.closed
 
 
@@ -374,7 +439,7 @@ def test_live_slash_waits_for_fresh_proof_and_identity() -> None:
         ]
     )
     worker = threading.Thread(
-        target=session_mod._drain_antigravity_loop,
+        target=session_mod._drain_exact_loop,
         args=(
             _Adapter(),
             cast(PreparedAntigravity, prepared),
@@ -472,7 +537,7 @@ def test_finalization_drains_four_chunks_before_finish() -> None:
         [(SlashCommand(command="exit"), datetime(2026, 7, 28, tzinfo=UTC))]
     )
 
-    session_mod._drain_antigravity_loop(
+    session_mod._drain_exact_loop(
         _Adapter(),
         cast(PreparedAntigravity, prepared),
         sink,
