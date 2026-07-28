@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import json
 
@@ -18,6 +20,10 @@ from trackinizer.types.agent_session_events import (
 )
 
 
+if TYPE_CHECKING:
+    import pytest
+
+
 def _encode(obj: object) -> bytes:
     return (json.dumps(obj) + "\n").encode()
 
@@ -31,6 +37,125 @@ def _parse_one(raw: bytes) -> Event | None:
     events = list(CodexAdapter().parse(raw, whole_file=False))
     assert len(events) <= 1, events
     return events[0] if events else None
+
+
+class TestCodexSessionId:
+    """Codex's rollout UUID is corroborated by the filename and session_meta."""
+
+    _SESSION_ID = "019fa3b5-e77c-7503-8cca-369d0b3e304d"
+
+    def _rollout(self, tmp_path: Path, session_id: str | None = None) -> Path:
+        suffix = session_id or self._SESSION_ID
+        return tmp_path / f"rollout-2026-07-27T15-13-55-{suffix}.jsonl"
+
+    def test_matching_session_meta_and_filename_return_native_id(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._rollout(tmp_path)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self._SESSION_ID,
+                        # Subagent rollouts point ``session_id`` at their root;
+                        # ``id`` is the identity of this rollout file.
+                        "session_id": "019f9fb7-96b9-7261-bc8a-4b82c6028b35",
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        assert CodexAdapter().session_id_from_path(path) == self._SESSION_ID
+
+    def test_filename_id_is_used_while_session_meta_is_not_yet_complete(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._rollout(tmp_path)
+        path.write_text('{"type":"session_meta","payload":')
+
+        assert CodexAdapter().session_id_from_path(path) == self._SESSION_ID
+
+    def test_session_meta_id_is_used_when_filename_has_no_uuid(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "rollout-unexpected-name.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": self._SESSION_ID},
+                }
+            )
+            + "\n"
+        )
+
+        assert CodexAdapter().session_id_from_path(path) == self._SESSION_ID
+
+    def test_mismatched_session_meta_and_filename_fail_closed(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._rollout(tmp_path)
+        other_id = "019fa3c1-d5de-7181-a4c6-90dd608fc015"
+        path.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": other_id}}) + "\n"
+        )
+
+        assert CodexAdapter().session_id_from_path(path) is None
+
+    def test_malformed_session_meta_id_falls_back_to_filename(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._rollout(tmp_path)
+        path.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "not-a-uuid"}}) + "\n"
+        )
+
+        assert CodexAdapter().session_id_from_path(path) == self._SESSION_ID
+
+    def test_path_without_rollout_shape_or_native_id_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        non_rollout = tmp_path / f"notes-{self._SESSION_ID}.jsonl"
+        non_rollout.write_text("")
+        rollout_without_id = tmp_path / "rollout-2026-07-27T15-13-55.jsonl"
+        rollout_without_id.write_text("")
+
+        adapter = CodexAdapter()
+        assert adapter.session_id_from_path(non_rollout) is None
+        assert adapter.session_id_from_path(rollout_without_id) is None
+
+    def test_custom_codex_home_and_symlinked_root_are_canonicalized(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        actual_home = tmp_path / "actual-codex-home"
+        sessions = actual_home / "sessions" / "2026" / "07" / "27"
+        sessions.mkdir(parents=True)
+        linked_home = tmp_path / "linked-codex-home"
+        linked_home.symlink_to(actual_home, target_is_directory=True)
+        monkeypatch.setenv("CODEX_HOME", str(linked_home))
+        rollout = sessions / (f"rollout-2026-07-27T15-13-55-{self._SESSION_ID}.jsonl")
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self._SESSION_ID,
+                        "session_id": self._SESSION_ID,
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        adapter = CodexAdapter()
+
+        assert tuple(adapter.session_dirs()) == (actual_home.resolve() / "sessions",)
+        assert adapter.matches_session_file(rollout)
+        assert adapter.session_id_from_path(rollout) == self._SESSION_ID
 
 
 class TestCodexParseLine:

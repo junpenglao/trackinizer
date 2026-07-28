@@ -20,8 +20,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Final, cast
+from uuid import UUID
 
 import json
+import os
 
 from trackinizer.lib.custom_json import JSON, json_freeze
 from trackinizer.trax.run.adapters.base import Event
@@ -59,8 +61,13 @@ class CodexAdapter:
 
     @property
     def _sessions_dir(self) -> Path:
-        # Resolve ``$HOME`` per call, not at import (see ClaudeAdapter).
-        return Path.home() / ".codex" / "sessions"
+        # Codex canonicalizes an explicit ``$CODEX_HOME`` (which may itself be
+        # a symlink) and otherwise defaults to ``~/.codex``. Resolve per call,
+        # not at import, so a switched home and tests see the same root as the
+        # wrapped process.
+        configured = os.environ.get("CODEX_HOME")
+        codex_home = Path(configured) if configured else Path.home() / ".codex"
+        return codex_home.resolve(strict=False) / "sessions"
 
     def session_dirs(self) -> Iterable[Path]:
         sessions = self._sessions_dir
@@ -71,17 +78,33 @@ class CodexAdapter:
         return (sessions,)
 
     def matches_session_file(self, path: Path) -> bool:
+        canonical = path.resolve(strict=False)
         return (
-            path.suffix == ".jsonl"
-            and path.name.startswith("rollout-")
-            and self._sessions_dir in path.parents
+            canonical.suffix == ".jsonl"
+            and canonical.name.startswith("rollout-")
+            and self._sessions_dir in canonical.parents
         )
 
     def session_id_from_path(self, path: Path) -> str | None:
-        # Codex's ``rollout-<ts>-<uuid>.jsonl`` has no single stable id this
-        # adapter extracts yet, so its runs are not correlation-resumable.
-        del path
-        return None
+        """Return Codex's native rollout id, corroborating its two sources.
+
+        Codex writes the same UUID in ``session_meta.payload.id`` and at the
+        end of ``rollout-<timestamp>-<uuid>.jsonl``. Either source is enough
+        while the file is being created, but two valid, differing UUIDs are
+        ambiguous and therefore fail closed rather than correlating the run to
+        the wrong AgentSession.
+        """
+        if path.suffix != ".jsonl" or not path.name.startswith("rollout-"):
+            return None
+        filename_id = _session_id_from_filename(path)
+        metadata_id = _session_id_from_metadata(path)
+        if (
+            filename_id is not None
+            and metadata_id is not None
+            and filename_id != metadata_id
+        ):
+            return None
+        return metadata_id or filename_id
 
     def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
         del whole_file  # codex is line-oriented; one line in.
@@ -103,6 +126,46 @@ class CodexAdapter:
         return (
             Event(message=message, timestamp=_timestamp(obj), model=self._last_model),
         )
+
+
+def _session_id_from_filename(path: Path) -> str | None:
+    """Extract the canonical trailing UUID from a Codex rollout filename."""
+    stem = path.stem
+    # A canonical UUID is 36 characters and Codex prefixes it with ``-``.
+    if len(stem) <= 37 or stem[-37] != "-":
+        return None
+    return _canonical_uuid(stem[-36:])
+
+
+def _session_id_from_metadata(path: Path) -> str | None:
+    """Read the native id from the first, ``session_meta``, JSONL record."""
+    try:
+        with path.open("rb") as source:
+            raw = source.readline()
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, Mapping) or parsed.get("type") != "session_meta":
+        return None
+    payload = parsed.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    # ``payload.session_id`` may point at a parent/root rollout for subagents;
+    # ``payload.id`` is this file's native identity and matches its filename.
+    return _canonical_uuid(payload.get("id"))
+
+
+def _canonical_uuid(value: object) -> str | None:
+    """Return a UUID in canonical text form, or ``None`` for provider drift."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
 
 
 def _to_message(obj: JSON) -> Message | None:
