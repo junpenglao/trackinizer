@@ -8,8 +8,9 @@ Three things run side by side:
    ways so the human still drives the native TUI (byte-transparent, though
    not literally inherited fds).
 
-2. A drain thread that watches the adapter's session directories and emits
-   events for each new log line, coping with rotation and new files.
+2. A drain thread that emits events from the wrapped process's transcript.
+   Antigravity is bound to one exact, provider-proven file; adapters without
+   an exact binding still use the legacy scoped directory scanner.
 
 3. When syncing, an inbound-poll thread that drains server-queued messages
    and injects them into the CLI via the pump.
@@ -45,6 +46,10 @@ from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
 from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
+from trackinizer.trax.run.antigravity_binding import (
+    PreparedAntigravity,
+    prepare_antigravity,
+)
 from trackinizer.trax.run.pty_pump import PtyPump
 from trackinizer.trax.run.sink import (
     FileSink,
@@ -54,6 +59,7 @@ from trackinizer.trax.run.sink import (
     TrackinizerSink,
 )
 from trackinizer.trax.run.slash import SlashCommandDetector
+from trackinizer.trax.run.transcript import TranscriptReader
 from trackinizer.types.agent_session_events import SlashCommand
 
 
@@ -234,105 +240,197 @@ def _spawn_and_drain(
     sink: Sink,
     stats: _Stats,
 ) -> int:
-    """Run the CLI on a PTY while daemon threads drain logs and inject inbound.
+    """Run one CLI and capture its transcript beside the owned PTY."""
+    # Resolve before any binding/sink side effect. A missing binary would fail
+    # only inside the forked child's execvp, where the parent cannot report it
+    # cleanly.
+    if shutil.which(adapter.cli_binary) is None:
+        raise SystemExit(f"trax run: {adapter.cli_binary} not found in PATH")
 
-    The CLI runs on a pseudo-terminal the wrapper owns (the pump), so the
-    server can splice messages in while the human drives the native TUI. The
-    drain thread reads the filesystem directly so it catches session files
-    created after the wrapper starts; the live path needs no ``tail``
-    subprocess. When syncing, an inbound-poll thread injects server-queued
-    messages through the pump.
-
-    To avoid sweeping in unrelated concurrent sessions (these CLIs share one
-    session root), we snapshot the files that exist *before* spawning and
-    drain only files this run creates afterward.
-    """
-    baseline = _existing_session_files(adapter)
-    # Captured right after the pre-fork baseline snapshot: any session file
-    # whose mtime predates this is an earlier run's, so the drain skips it even
-    # if it raced past the baseline (#283 cross-pollination).
-    spawn_time = time.time()
+    exact_adapter = adapter if isinstance(adapter, AntigravityAdapter) else None
+    prepared = (
+        prepare_antigravity(exact_adapter, config.cli_args, cwd=Path.cwd())
+        if exact_adapter is not None
+        else None
+    )
+    # Claude/Codex retain the legacy scoped scanner until their provider proof
+    # seams land. Antigravity must never enumerate its shared archive.
+    legacy_capture = (
+        (_existing_session_files(adapter), time.time()) if prepared is None else None
+    )
     stop = threading.Event()
-
-    # Slash-commands the human types (``/exit``) are handled inside the CLI and
-    # never logged, so the drain thread can't see them. The pump tees the
-    # human's keystrokes into a detector (main thread); detected commands queue
-    # here and the drain thread -- the single sink writer -- emits them, so they
-    # serialize with file-sourced events rather than racing the sink.
+    inbound_stop = threading.Event()
+    binding_ready = threading.Event() if prepared is not None else None
     slash_queue: deque[tuple[SlashCommand, datetime]] = deque()
     detector = SlashCommandDetector(
         lambda command, at: slash_queue.append((command, at))
     )
+    started: list[tuple[threading.Thread, str]] = []
+    drain_errors: list[Exception] = []
 
-    def _drain_loop() -> None:
-        _drain_filesystem_loop(
-            adapter,
-            sink,
-            stats,
-            config,
-            stop,
-            baseline=baseline,
-            slash_queue=slash_queue,
-            spawn_time=spawn_time,
+    try:
+        if prepared is not None and prepared.expected_cli_session_id is not None:
+            # Central reconciliation must see a proven resume identity in the
+            # initial SessionStart, before the sink opens its row.
+            sink.set_cli_session_id(prepared.expected_cli_session_id)
+        granted_actor = sink.open()
+        cli_args = prepared.cli_args if prepared is not None else config.cli_args
+        pump = PtyPump(
+            [adapter.cli_binary, *cli_args],
+            env=_routing_env(config, granted_actor=granted_actor),
+            on_input=detector.feed,
         )
 
-    drain_thread = threading.Thread(target=_drain_loop, daemon=True)
-    drain_thread.start()
+        if prepared is None:
+            assert legacy_capture is not None
+            baseline, spawn_time = legacy_capture
 
-    # Resolve the binary before forking: after ``pty.fork`` a missing binary
-    # would fail in the child's ``execvp``, not here, so the parent could not
-    # turn it into a clean ``SystemExit``.
-    if shutil.which(adapter.cli_binary) is None:
-        stop.set()
-        drain_thread.join(timeout=1.0)
-        raise SystemExit(f"trax run: {adapter.cli_binary} not found in PATH")
+            def drain() -> None:
+                _drain_filesystem_loop(
+                    adapter,
+                    sink,
+                    stats,
+                    config,
+                    stop,
+                    baseline=baseline,
+                    slash_queue=slash_queue,
+                    spawn_time=spawn_time,
+                )
 
-    argv: list[str] = [adapter.cli_binary, *config.cli_args]
-    # Open the session eagerly (before fork) so the server-granted routing
-    # handle is in the child env from the start: an agent inside must know its
-    # real address (``scientist#2`` on a collision), not the requested name
-    # (#453). A local-file / dry-run sink has no server session and returns
-    # None, so the requested ``config.actor`` is exported unchanged.
-    granted_actor = sink.open()
-    # Run the CLI on a PTY we own rather than letting it inherit the terminal:
-    # owning the master fd is what lets the server splice messages into the
-    # live session (the human still drives the native TUI). Byte-transparent,
-    # so display fidelity matches running the CLI directly. Export the
-    # session's routing identity so an agent inside can address peers
-    # (``trax send @other``) and know which rooms it is reachable in.
-    pump = PtyPump(
-        argv,
-        env=_routing_env(config, granted_actor=granted_actor),
-        on_input=detector.feed,
-    )
+        else:
+            assert exact_adapter is not None
 
-    # Poll the server for inbound messages and inject them into the live CLI.
-    # Only when syncing: a local-file run has no server session to poll.
-    poll_thread: threading.Thread | None = None
-    if config.sync and config.client is not None:
-        poll_thread = threading.Thread(
-            target=_inbound_poll_loop,
-            args=(config.client, sink, pump, stop),
-            daemon=True,
+            def fail_exact_drain(err: Exception) -> None:
+                drain_errors.append(err)
+                stop.set()
+                inbound_stop.set()
+                pump.terminate()
+
+            def drain() -> None:
+                try:
+                    _drain_antigravity_loop(
+                        exact_adapter,
+                        prepared,
+                        sink,
+                        stats,
+                        config,
+                        stop=stop,
+                        slash_queue=slash_queue,
+                        binding_ready=binding_ready,
+                    )
+                except Exception as err:
+                    fail_exact_drain(err)
+
+        drain_thread = threading.Thread(target=drain, daemon=True)
+
+        def poll_inbound() -> None:
+            assert config.client is not None
+            _poll_inbound_after_binding(
+                config.client,
+                sink,
+                pump,
+                inbound_stop,
+                binding_ready=binding_ready,
+            )
+
+        poll_thread = (
+            threading.Thread(target=poll_inbound, daemon=True)
+            if config.sync and config.client is not None
+            else None
         )
-        poll_thread.start()
 
-    rc = pump.run()
+        def start_workers() -> None:
+            drain_thread.start()
+            started.append((drain_thread, "drain"))
+            if poll_thread is not None:
+                poll_thread.start()
+                started.append((poll_thread, "inbound poll"))
 
-    # Let the drain thread finish pending reads before stopping it.
-    time.sleep(config.quiesce_seconds)
-    stop.set()
-    # Join with a generous bound so the worker threads normally stop before
-    # ``run`` calls ``sink.close``: an unbounded-feeling wait lets a slow drain
-    # (a retrying server POST) finish rather than racing ``close`` (R2R-024).
-    # The watchdog caps the worst case -- a permanently wedged POST -- so the
-    # process can never hang forever; the LockedSink's ``close`` then acquires
-    # its lock with a short timeout and skips locked teardown rather than
-    # deadlocking against a straggler that outlived the watchdog.
-    _join_with_watchdog(drain_thread, "drain")
-    if poll_thread is not None:
-        _join_with_watchdog(poll_thread, "inbound poll")
-    return rc
+        try:
+            rc = pump.run(on_started=start_workers)
+            inbound_stop.set()
+            # A fatal exact-drain error sets ``stop`` and wakes this immediately.
+            stop.wait(config.quiesce_seconds)
+        finally:
+            stop.set()
+            inbound_stop.set()
+            for thread, name in started:
+                if prepared is not None and thread is drain_thread:
+                    # The exact binding owns descriptors and may still emit its
+                    # required final suffix. Teardown cannot race it; provider
+                    # and HTTP operations are independently bounded.
+                    thread.join()
+                else:
+                    _join_with_watchdog(thread, name)
+
+        if drain_errors:
+            raise drain_errors[0]
+        return rc
+    finally:
+        # Main owns exact descriptor teardown after the PTY child is reaped and
+        # every started worker is joined. Releasing the transcript lock from
+        # the drain thread would let a second resume overlap a still-terminating
+        # provider during PtyPump's SIGTERM grace window.
+        if prepared is not None:
+            prepared.close()
+
+
+def _drain_antigravity_loop(
+    adapter: AntigravityAdapter,
+    prepared: PreparedAntigravity,
+    sink: Sink,
+    stats: _Stats,
+    config: RunConfig,
+    *,
+    stop: threading.Event,
+    slash_queue: deque[tuple[SlashCommand, datetime]],
+    binding_ready: threading.Event | None = None,
+    poll_interval: float = 0.2,
+) -> None:
+    """Drain only the transcript proven by this Antigravity process."""
+    reader: TranscriptReader | None = None
+    native_id_set = prepared.expected_cli_session_id is not None
+
+    def bind() -> TranscriptReader | None:
+        nonlocal reader, native_id_set
+        observed = prepared.poll()
+        if observed is None:
+            return reader
+        if reader is not None and observed is not reader:
+            raise RuntimeError("Antigravity binding changed transcript reader")
+        if reader is None:
+            reader = observed
+            if not native_id_set:
+                sink.set_cli_session_id(reader.cli_session_id)
+                native_id_set = True
+            if binding_ready is not None:
+                binding_ready.set()
+        return reader
+
+    def drain_reader(active: TranscriptReader) -> None:
+        for raw in active.read_lines():
+            _process_chunk(raw, adapter, sink, stats, config)
+
+    while not stop.is_set():
+        if active := bind():
+            _emit_slash_commands(adapter, sink, stats, config, slash_queue)
+            drain_reader(active)
+            sink.flush()
+        if stop.wait(poll_interval):
+            break
+
+    # The PTY child has exited before the main thread sets ``stop``. Consume
+    # final proof, then exhaust every bounded transcript chunk without loss.
+    final_reader = prepared.finish()
+    if not native_id_set:
+        sink.set_cli_session_id(final_reader.cli_session_id)
+    if binding_ready is not None:
+        binding_ready.set()
+    _emit_slash_commands(adapter, sink, stats, config, slash_queue)
+    while not final_reader.caught_up():
+        drain_reader(final_reader)
+    final_reader.finish()
+    sink.flush()
 
 
 def _join_with_watchdog(
@@ -394,6 +492,23 @@ def _inbound_poll_loop(
             _logger.debug("inbound poll failed", exc_info=True)
         if stop.wait(poll_interval):
             break
+
+
+def _poll_inbound_after_binding(
+    client: Client,
+    sink: Sink,
+    pump: PtyPump,
+    stop: threading.Event,
+    *,
+    binding_ready: threading.Event | None,
+) -> None:
+    """Poll only after exact provider proof, and never after local exit."""
+    if binding_ready is not None:
+        while not binding_ready.wait(0.1):
+            if stop.is_set():
+                return
+    if not stop.is_set():
+        _inbound_poll_loop(client, sink, pump, stop)
 
 
 def _render_inbound(text: str, source: str | None, room: str | None) -> str:
