@@ -52,7 +52,6 @@ class CodexAdapter:
 
     name: str = "codex"
     cli_binary: str = "codex"
-    whole_file: bool = False
 
     def __init__(self) -> None:
         # The most recent ``turn_context.model``, stamped onto subsequent
@@ -106,8 +105,7 @@ class CodexAdapter:
             return None
         return metadata_id or filename_id
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        del whole_file  # codex is line-oriented; one line in.
+    def parse(self, raw: bytes) -> Iterable[Event]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:

@@ -83,7 +83,6 @@ class _FakeAdapter:
 
     name: str = "fake"
     cli_binary: str = "fake"
-    whole_file: bool = False
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -98,42 +97,8 @@ class _FakeAdapter:
         del path
         return None
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        del whole_file
+    def parse(self, raw: bytes) -> Iterable[Event]:
         return (Event(message=UserMessage(text=raw.decode())),)
-
-
-class _WholeFileAdapter:
-    """A whole-file adapter: the runner must feed it the entire file body.
-
-    Models a CLI that rewrites one JSON object in place rather than appending
-    lines. ``parse`` reads ``messages[-1]`` from the whole body.
-    """
-
-    name: str = "wholefile"
-    cli_binary: str = "wholefile"
-    whole_file: bool = True
-
-    def __init__(self, root: Path) -> None:
-        self._root = root
-
-    def session_dirs(self) -> Iterable[Path]:
-        return (self._root,)
-
-    def matches_session_file(self, path: Path) -> bool:
-        return path.suffix == ".json"
-
-    def session_id_from_path(self, path: Path) -> str | None:
-        del path
-        return None
-
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        assert whole_file
-        obj = cast("dict[str, list[str]]", json.loads(raw))
-        messages = obj.get("messages") or []
-        if not messages:
-            return ()
-        return (Event(message=UserMessage(text=messages[-1])),)
 
 
 class _PoisonAdapter:
@@ -141,7 +106,6 @@ class _PoisonAdapter:
 
     name: str = "poison"
     cli_binary: str = "poison"
-    whole_file: bool = False
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -156,8 +120,7 @@ class _PoisonAdapter:
         del path
         return None
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        del whole_file
+    def parse(self, raw: bytes) -> Iterable[Event]:
         if raw == b"boom":
             raise ValueError("parser blew up")
         return (Event(message=UserMessage(text=raw.decode())),)
@@ -354,75 +317,6 @@ class TestAntigravityLineDrain:
         assert second_message.text == "second"
 
 
-class TestWholeFileDrain:
-    """A whole-file adapter must receive the entire file and be re-read."""
-
-    def test_in_place_rewrite_emits_event(self, tmp_path: Path) -> None:
-        log = tmp_path / "session-x.json"
-        log.write_text(json.dumps({"messages": ["hello"]}))
-        adapter = _WholeFileAdapter(tmp_path)
-
-        # No baseline; the freshly-written whole-file session is in scope.
-        stats, sink = _scan_once(adapter, frozenset())
-
-        # The byte-offset drain would feed a partial slice and emit nothing;
-        # a whole-file drain hands the full body over and emits one event.
-        assert stats.counts == {"UserMessage": 1}
-        texts = [cast("UserMessage", e.message).text for _, _, e in sink.events]
-        assert texts == ["hello"]
-
-    def test_same_size_rewrite_emits_event(self, tmp_path: Path) -> None:
-        """A whole-file rewrite to identical byte size still emits an event.
-
-        A same-length edit keeps ``st_size`` unchanged. Tracking size alone
-        makes the second scan skip the re-read, dropping the new turn. The
-        drain must detect the change via mtime or content, not size alone.
-        """
-        log = tmp_path / "session-x.json"
-        # Two payloads with the same single-character last message: identical
-        # byte length, different content.
-        log.write_text(json.dumps({"messages": ["a"]}))
-        adapter = _WholeFileAdapter(tmp_path)
-        sink = _RecordingSink()
-        stats = _Stats()
-        config = RunConfig(cli_name="fake")
-        stamps: dict[Path, tuple[int, int]] = {}
-
-        _scan_and_read(
-            adapter,
-            sink,
-            stats,
-            config,
-            {},
-            buffers={},
-            baseline=frozenset(),
-            stamps=stamps,
-        )
-        assert [cast("UserMessage", e.message).text for _, _, e in sink.events] == ["a"]
-
-        # Same byte length, different content; bump mtime so a time-based
-        # detector sees the change even on a coarse-grained filesystem clock.
-        first_mtime = log.stat().st_mtime
-        log.write_text(json.dumps({"messages": ["b"]}))
-        os.utime(log, (first_mtime + 1, first_mtime + 1))
-        assert log.stat().st_size == len(json.dumps({"messages": ["a"]}))
-
-        _scan_and_read(
-            adapter,
-            sink,
-            stats,
-            config,
-            {},
-            buffers={},
-            baseline=frozenset(),
-            stamps=stamps,
-        )
-        assert [cast("UserMessage", e.message).text for _, _, e in sink.events] == [
-            "a",
-            "b",
-        ]
-
-
 class TestDrainSurvivesParseError:
     """A parser exception on one line must not stop capture for the rest."""
 
@@ -457,7 +351,6 @@ class TestDrainSurvivesParseError:
                 sink,
                 _Stats(),
                 RunConfig(cli_name="poison"),
-                whole_file=False,
             )
         records = [r for r in caplog.records if "failed to parse" in r.getMessage()]
         assert len(records) == 1
@@ -646,45 +539,7 @@ class TestEmitSlashCommands:
 
 
 class TestDryRunDrain:
-    """The dry-run replay must dispatch each adapter by its drain shape."""
-
-    def test_whole_file_adapter_emits_existing_body(self, tmp_path: Path) -> None:
-        """Dry-run on a whole-file session re-reads and emits its turn.
-
-        K3: dry-run used to feed every adapter through ``tail``'s line-split
-        (``whole_file=False``), so a whole-file JSON body never parsed and no
-        event was emitted. The dry-run replay must dispatch whole-file adapters
-        to the re-read path, exactly like the live drain.
-        """
-        log = tmp_path / "session-x.json"
-        log.write_text(json.dumps({"messages": ["replayed"]}))
-        adapter = _WholeFileAdapter(tmp_path)
-        sink = _RecordingSink()
-        stats = _Stats()
-        stop = threading.Event()
-        rc: list[int] = []
-
-        def _run() -> None:
-            rc.append(
-                session_mod._dry_run_drain(
-                    RunConfig(cli_name="wholefile"),
-                    cast(Adapter, adapter),
-                    sink,
-                    stats,
-                    stop=stop,
-                )
-            )
-
-        worker = threading.Thread(target=_run, daemon=True)
-        worker.start()
-        # Let at least one poll happen, then stop; a final sweep still runs.
-        time.sleep(0.3)
-        stop.set()
-        worker.join(timeout=5.0)
-        assert not worker.is_alive(), "dry-run loop did not stop"
-        assert rc == [0]
-        texts = [cast("UserMessage", e.message).text for _, _, e in sink.events]
-        assert texts == ["replayed"]
+    """Dry-run replay stops promptly when requested."""
 
     def test_returns_when_stopped(self, tmp_path: Path) -> None:
         """The dry-run loop exits promptly once ``stop`` is set (no spin)."""

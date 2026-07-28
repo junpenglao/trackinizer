@@ -59,7 +59,6 @@ class ClaudeAdapter:
 
     name: str = "claude"
     cli_binary: str = "claude"
-    whole_file: bool = False
 
     @property
     def _projects_dir(self) -> Path:
@@ -92,8 +91,7 @@ class ClaudeAdapter:
             return None
         return path.stem or None
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        del whole_file  # claude is line-oriented; one line in.
+    def parse(self, raw: bytes) -> Iterable[Event]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:

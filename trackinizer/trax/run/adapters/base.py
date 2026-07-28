@@ -56,15 +56,6 @@ class Adapter(Protocol):
     cli_binary: str
     """The executable we exec (``"claude"`` / ``"agy"`` / ``"codex"``)."""
 
-    whole_file: bool
-    """How the runner drains this adapter's session files.
-
-    ``False``: the log is append-only JSONL; the runner follows a byte offset
-    and hands each new newline-terminated line to :meth:`parse`. ``True``:
-    the CLI rewrites one JSON object in place, so the runner re-reads the
-    whole file on each change and hands the entire body to :meth:`parse`.
-    """
-
     def session_dirs(self) -> Iterable[Path]:
         """Directories the wrapped CLI writes session files to.
 
@@ -91,19 +82,16 @@ class Adapter(Protocol):
         """
         ...
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        """Translate one raw chunk into zero or more ``Event``s.
+    def parse(self, raw: bytes) -> Iterable[Event]:
+        """Translate one appended JSONL record into zero or more ``Event``s.
 
         One transport chunk is not one turn: a single line can carry several
-        results (claude's batched parallel ``tool_result`` blocks), and a
-        whole-file body carries the latest turn. Yielding an iterable lets the
-        adapter map a chunk to however many turns it really contains.
+        results (claude's batched parallel ``tool_result`` blocks). Yielding an
+        iterable lets the adapter map a record to however many turns it really
+        contains.
 
         Args:
-          raw: One newline-terminated log line (``whole_file=False``) or the
-            entire file body (``whole_file=True``), matching :attr:`whole_file`.
-          whole_file: Whether ``raw`` is the full file (vs. one appended line);
-            the runner passes the adapter's own :attr:`whole_file` value.
+          raw: One complete, newline-delimited session-log record.
 
         Yields:
           event: One captured turn. Non-event chunks (blank lines, CLI

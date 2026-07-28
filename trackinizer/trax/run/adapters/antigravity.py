@@ -58,7 +58,6 @@ class AntigravityAdapter:
 
     name: str = "agy"
     cli_binary: str = "agy"
-    whole_file: bool = False
 
     @property
     def _brain_dir(self) -> Path:
@@ -113,8 +112,7 @@ class AntigravityAdapter:
         # normalization.
         return candidate if str(parsed) == candidate else None
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        del whole_file  # Antigravity's transcript is line-oriented; one record in.
+    def parse(self, raw: bytes) -> Iterable[Event]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:

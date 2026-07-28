@@ -17,9 +17,8 @@ Three things run side by side:
 When the CLI exits, the wrapper drains pending lines for a short quiesce
 window, closes the sink, and exits with the CLI's status.
 
-``--dry-run`` skips spawning the CLI and replays existing session files
-(the same per-shape drain as the live path), useful for adapter development
-or replaying a finished session.
+``--dry-run`` skips spawning the CLI and replays existing session files,
+useful for adapter development or replaying a finished session.
 """
 
 from __future__ import annotations
@@ -485,7 +484,6 @@ def _drain_filesystem_loop(
     """
     offsets: dict[Path, int] = {}
     buffers: dict[Path, bytearray] = {}
-    stamps: dict[Path, tuple[int, int]] = {}
     poll_interval = 0.2
 
     while not stop.is_set():
@@ -498,7 +496,6 @@ def _drain_filesystem_loop(
             offsets=offsets,
             buffers=buffers,
             baseline=baseline,
-            stamps=stamps,
             spawn_time=spawn_time,
         )
         if stop.wait(poll_interval):
@@ -512,7 +509,6 @@ def _drain_filesystem_loop(
         offsets=offsets,
         buffers=buffers,
         baseline=baseline,
-        stamps=stamps,
         spawn_time=spawn_time,
     )
 
@@ -527,7 +523,6 @@ def _drain_tick(
     offsets: dict[Path, int],
     buffers: dict[Path, bytearray],
     baseline: frozenset[Path],
-    stamps: dict[Path, tuple[int, int]],
     spawn_time: float,
 ) -> None:
     """Run one drain pass, swallowing any unhandled error to survive (R-57).
@@ -550,7 +545,6 @@ def _drain_tick(
             offsets,
             buffers=buffers,
             baseline=baseline,
-            stamps=stamps,
             spawn_time=spawn_time,
         )
         sink.flush()
@@ -594,7 +588,6 @@ def _scan_and_read(
     *,
     buffers: dict[Path, bytearray],
     baseline: frozenset[Path],
-    stamps: dict[Path, tuple[int, int]] | None = None,
     spawn_time: float = 0.0,
     mtime_grace_sec: float = 2.0,
 ) -> None:
@@ -612,13 +605,8 @@ def _scan_and_read(
       spawn because A started first). ``0.0`` disables the floor (legacy
       callers / tests that only exercise the baseline path).
 
-    ``stamps`` carries the per-file ``(size, mtime_ns)`` change-detection state
-    for whole-file adapters; ``offsets`` carries the byte offset for line
-    adapters. A run uses exactly one (``adapter.whole_file`` is fixed), so the
-    unused dict stays empty.
+    ``offsets`` carries one byte cursor per matching append-only JSONL file.
     """
-    if stamps is None:
-        stamps = {}
     for session_dir in adapter.session_dirs():
         if not session_dir.is_dir():
             continue
@@ -646,7 +634,7 @@ def _scan_and_read(
             cli_session_id = adapter.session_id_from_path(path)
             if cli_session_id is not None:
                 sink.set_cli_session_id(cli_session_id)
-            _drain_file(
+            _drain_appended_lines(
                 path,
                 adapter,
                 sink,
@@ -654,64 +642,7 @@ def _scan_and_read(
                 config,
                 offsets=offsets,
                 buffers=buffers,
-                stamps=stamps,
             )
-
-
-def _drain_file(
-    path: Path,
-    adapter: Adapter,
-    sink: Sink,
-    stats: _Stats,
-    config: RunConfig,
-    *,
-    offsets: dict[Path, int],
-    buffers: dict[Path, bytearray],
-    stamps: dict[Path, tuple[int, int]],
-) -> None:
-    """Emit events for one file's new content, by the adapter's drain shape.
-
-    Whole-file adapters get the entire body re-read on each change; line
-    adapters follow a byte offset and emit per newline-terminated line.
-    """
-    if adapter.whole_file:
-        _drain_whole_file(path, adapter, sink, stats, config, stamps=stamps)
-        return
-    _drain_appended_lines(
-        path, adapter, sink, stats, config, offsets=offsets, buffers=buffers
-    )
-
-
-def _drain_whole_file(
-    path: Path,
-    adapter: Adapter,
-    sink: Sink,
-    stats: _Stats,
-    config: RunConfig,
-    *,
-    stamps: dict[Path, tuple[int, int]],
-) -> None:
-    """Re-read a whole-file session and parse its full body when it changes.
-
-    ``stamps`` records the last seen ``(size, mtime_ns)`` per file; an
-    unchanged stamp skips the re-read so an idle file is not reparsed every
-    poll. Tracking mtime alongside size is what catches an in-place edit to
-    identical byte size, which a size-only check would silently drop.
-    """
-    try:
-        info = path.stat()
-    except OSError:
-        return
-    stamp = (info.st_size, info.st_mtime_ns)
-    if stamp == stamps.get(path):
-        return
-    try:
-        body = path.read_bytes()
-    except OSError:
-        return
-    stamps[path] = stamp
-    if body.strip():
-        _process_chunk(body, adapter, sink, stats, config, whole_file=True)
 
 
 def _drain_appended_lines(
@@ -752,7 +683,7 @@ def _drain_appended_lines(
         del buf[: nl + 1]
         if not line.strip():
             continue
-        _process_chunk(line, adapter, sink, stats, config, whole_file=False)
+        _process_chunk(line, adapter, sink, stats, config)
 
 
 def _process_chunk(
@@ -761,8 +692,6 @@ def _process_chunk(
     sink: Sink,
     stats: _Stats,
     config: RunConfig,
-    *,
-    whole_file: bool,
 ) -> None:
     """Parse one chunk into events and emit each; never let a parser bug abort.
 
@@ -772,7 +701,7 @@ def _process_chunk(
     capture, so a parser failure logs and skips the chunk instead.
     """
     try:
-        events = tuple(adapter.parse(raw, whole_file=whole_file))
+        events = tuple(adapter.parse(raw))
     except Exception:
         # ``exc_info`` so the swallowed failure carries a traceback: without it
         # a malformed-output loss is an opaque one-liner with no clue which
@@ -802,12 +731,9 @@ def _dry_run_drain(
 ) -> int:
     """The ``--dry-run`` loop: replay existing session files until Ctrl-C.
 
-    Polls the adapter's session dirs with the same per-shape dispatch as the
-    live drain (:func:`_scan_and_read`), so a whole-file adapter is re-read
-    whole and a line adapter follows byte offsets -- unlike the old ``tail -F``
-    path, which line-split every adapter and so could never parse a whole-file
-    JSON body. The baseline is empty (dry-run *replays* existing files, the
-    point of an offline session review).
+    Polls the adapter's session dirs through the same append-only JSONL drain
+    as the live path. The baseline is empty (dry-run *replays* existing files,
+    the point of an offline session review).
 
     ``stop`` ends the loop (tests inject it); in a real run it is ``None`` and
     a ``KeyboardInterrupt`` (Ctrl-C) ends it instead. Either way a final sweep
@@ -816,7 +742,6 @@ def _dry_run_drain(
     stop = stop or threading.Event()
     offsets: dict[Path, int] = {}
     buffers: dict[Path, bytearray] = {}
-    stamps: dict[Path, tuple[int, int]] = {}
     sys.stderr.write("[trax run] dry-run: replaying session files; Ctrl-C to stop\n")
     try:
         while not stop.is_set():
@@ -828,7 +753,6 @@ def _dry_run_drain(
                 offsets,
                 buffers=buffers,
                 baseline=frozenset(),
-                stamps=stamps,
             )
             sink.flush()
             if stop.wait(0.2):
@@ -844,7 +768,6 @@ def _dry_run_drain(
         offsets,
         buffers=buffers,
         baseline=frozenset(),
-        stamps=stamps,
     )
     sink.flush()
     return 0

@@ -473,7 +473,6 @@ class _LineAdapter:
 
     name: str = "fakeline"
     cli_binary: str = "fakeline"
-    whole_file: bool = False
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -488,8 +487,7 @@ class _LineAdapter:
         del path
         return None
 
-    def parse(self, raw: bytes, *, whole_file: bool) -> Iterator[Event]:
-        del whole_file
+    def parse(self, raw: bytes) -> Iterator[Event]:
         yield Event(message=UserMessage(text=raw.decode()))
 
 

@@ -32,7 +32,7 @@ def _encode(obj: object) -> bytes:
 
 
 def _parse_one(raw: bytes) -> Event | None:
-    events = list(AntigravityAdapter().parse(raw, whole_file=False))
+    events = list(AntigravityAdapter().parse(raw))
     assert len(events) <= 1, events
     return events[0] if events else None
 
@@ -229,8 +229,7 @@ class TestAntigravityParseLine:
                     source="MODEL",
                     record_type="PLANNER_RESPONSE",
                     tool_calls=[{"name": "list_permissions", "args": {}}],
-                ),
-                whole_file=False,
+                )
             )
         )
         result_events = list(
@@ -240,8 +239,7 @@ class TestAntigravityParseLine:
                     source="MODEL",
                     record_type="GENERIC",
                     content="permission result",
-                ),
-                whole_file=False,
+                )
             )
         )
 
@@ -442,9 +440,6 @@ class TestAntigravityParseLine:
         )
         assert event is not None
         assert event.timestamp is None
-
-    def test_is_append_only_line_adapter(self) -> None:
-        assert AntigravityAdapter().whole_file is False
 
 
 if __name__ == "__main__":

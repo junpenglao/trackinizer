@@ -31,7 +31,7 @@ def _encode(obj: object) -> bytes:
 
 def _parse_one(raw: bytes) -> Event | None:
     """The single event for a one-message line, or ``None`` when skipped."""
-    events = list(adapter.parse(raw, whole_file=False))
+    events = list(adapter.parse(raw))
     assert len(events) <= 1, events
     return events[0] if events else None
 
@@ -192,8 +192,7 @@ class TestClaudeParseLine:
                         {"type": "tool_result", "tool_use_id": "a", "content": "ra"},
                         {"type": "tool_result", "tool_use_id": "b", "content": "rb"},
                     ]
-                ),
-                whole_file=False,
+                )
             )
         )
         results = [e.message for e in events]

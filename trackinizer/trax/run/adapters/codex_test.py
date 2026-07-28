@@ -34,7 +34,7 @@ def _parse_one(raw: bytes) -> Event | None:
     A fresh ``CodexAdapter`` per call so the carried ``_last_model`` state never
     leaks between cases.
     """
-    events = list(CodexAdapter().parse(raw, whole_file=False))
+    events = list(CodexAdapter().parse(raw))
     assert len(events) <= 1, events
     return events[0] if events else None
 
@@ -394,8 +394,7 @@ class TestCodexParseLine:
         assert (
             list(
                 local.parse(
-                    _encode({"type": "turn_context", "payload": {"model": "gpt-5.5"}}),
-                    whole_file=False,
+                    _encode({"type": "turn_context", "payload": {"model": "gpt-5.5"}})
                 )
             )
             == []
@@ -411,8 +410,7 @@ class TestCodexParseLine:
                             "content": [{"type": "output_text", "text": "hi"}],
                         },
                     }
-                ),
-                whole_file=False,
+                )
             )
         )
         assert len(events) == 1
