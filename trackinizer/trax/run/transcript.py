@@ -35,7 +35,7 @@ _MAX_RECORD_BYTES = 16 << 20
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FileBoundary:
-    """The exact transcript inode and EOF observed before provider launch."""
+    """One validated inode/EOF sentinel captured before launch or at final seal."""
 
     size: int
     device: int
@@ -116,6 +116,7 @@ class TranscriptReader:
         self._inode = inode
         self._guard = guard
         self._buffer = bytearray()
+        self._final_boundary: FileBoundary | None = None
 
     @classmethod
     def open(cls, adapter: Adapter, claim: TranscriptClaim) -> Self:
@@ -174,9 +175,16 @@ class TranscriptReader:
     def read_lines(self) -> tuple[bytes, ...]:
         """Read the current suffix and return complete, unreplayed records."""
         info = self._validated_info()
-        if info.st_size > self._offset:
-            read_size = min(info.st_size - self._offset, _READ_BYTES)
+        end = (
+            self._final_boundary.size
+            if self._final_boundary is not None
+            else info.st_size
+        )
+        if end > self._offset:
+            read_size = min(end - self._offset, _READ_BYTES)
             chunk = os.pread(self._fd, read_size, self._offset)
+            if not chunk:
+                raise TranscriptError("owned transcript read made no progress")
             self._buffer.extend(chunk)
             self._offset += len(chunk)
             self._guard = (self._guard + chunk)[-_BOUNDARY_BYTES:]
@@ -188,14 +196,33 @@ class TranscriptReader:
                 if len(self._buffer) > _MAX_RECORD_BYTES:
                     raise TranscriptError("transcript record exceeds 16 MiB")
                 return tuple(lines)
+            if newline > _MAX_RECORD_BYTES:
+                raise TranscriptError("transcript record exceeds 16 MiB")
             line = bytes(self._buffer[:newline])
             del self._buffer[: newline + 1]
             if line.strip():
                 lines.append(line)
 
+    def seal(self) -> None:
+        """Freeze the final EOF so later provider appends cannot extend this run."""
+        info = self._validated_info()
+        if self._final_boundary is None:
+            self._final_boundary = FileBoundary(
+                size=info.st_size,
+                device=info.st_dev,
+                inode=info.st_ino,
+                tail=_read_tail(self._fd, info.st_size),
+            )
+
     def caught_up(self) -> bool:
-        """Whether every byte currently in the owned transcript was read."""
-        return self._validated_info().st_size == self._offset
+        """Whether every byte through the live or sealed EOF was read."""
+        info = self._validated_info()
+        end = (
+            self._final_boundary.size
+            if self._final_boundary is not None
+            else info.st_size
+        )
+        return end == self._offset
 
     def _validated_info(self) -> os.stat_result:
         """Validate the retained transcript and return its current metadata."""
@@ -209,10 +236,18 @@ class TranscriptReader:
         if info.st_size < self._offset:
             raise TranscriptError("owned transcript shrunk after binding")
         _verify_tail(self._fd, self._offset, self._guard)
+        final = self._final_boundary
+        if final is not None:
+            if info.st_size < final.size:
+                raise TranscriptError("owned transcript shrunk after final seal")
+            if _read_tail(self._fd, final.size) != final.tail:
+                raise TranscriptError("owned transcript changed at final seal")
         return info
 
     def finish(self) -> None:
         """Require a fully drained transcript ending at a record boundary."""
+        if self._final_boundary is None:
+            raise TranscriptError("transcript must be sealed before finish")
         if not self.caught_up():
             raise TranscriptError("transcript still has unread bytes")
         if self._buffer.strip():
@@ -385,7 +420,12 @@ def _read_first_record(fd: int, size: int) -> bytes | None:
 def _read_tail(fd: int, offset: int) -> bytes:
     """Read the small append-only sentinel ending at ``offset``."""
     size = min(offset, _BOUNDARY_BYTES)
-    return os.pread(fd, size, offset - size) if size else b""
+    if not size:
+        return b""
+    tail = os.pread(fd, size, offset - size)
+    if len(tail) != size:
+        raise TranscriptError("transcript changed while reading boundary")
+    return tail
 
 
 def _snapshot_boundary(fd: int, info: os.stat_result) -> FileBoundary:

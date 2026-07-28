@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
+import os
 import time
 
 import pytest
 
+from trackinizer.trax.run import antigravity_binding as binding_mod
 from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.antigravity_binding import (
     AntigravityBindingError,
@@ -413,6 +415,53 @@ class TestAntigravityProof:
             assert time.perf_counter() - started <= 0.005
             assert prepared.finish().cli_session_id == ID_A
 
+    def test_finish_seals_transcript_before_return(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _adapter(tmp_path, monkeypatch)
+        transcript = _transcript(adapter, ID_A, b"captured\n")
+        with prepare_antigravity(
+            adapter, (), cwd=tmp_path, runtime_root=tmp_path / "runtime"
+        ) as prepared:
+            _append(prepared.diagnostic_path, _marker("Created conversation", ID_A))
+            reader = prepared.finish()
+            _append(transcript, b"later\n")
+
+            assert reader.read_lines() == (b"captured",)
+            assert reader.caught_up()
+            reader.finish()
+
+    def test_finish_seals_diagnostic_before_final_poll(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _adapter(tmp_path, monkeypatch)
+        _transcript(adapter, ID_A, b"captured\n")
+        with prepare_antigravity(
+            adapter, (), cwd=tmp_path, runtime_root=tmp_path / "runtime"
+        ) as prepared:
+            _append(prepared.diagnostic_path, _marker("Created conversation", ID_A))
+            diagnostic_type = (  # pyright: ignore[reportPrivateUsage]
+                binding_mod._Diagnostic
+            )
+            read_lines = diagnostic_type.read_lines
+            appended = False
+
+            def read_then_append(
+                diagnostic: binding_mod._Diagnostic,  # pyright: ignore[reportPrivateUsage]
+            ) -> tuple[bytes, ...]:
+                nonlocal appended
+                lines = read_lines(diagnostic)
+                if not appended:
+                    appended = True
+                    _append(
+                        diagnostic.path,
+                        _marker("Created conversation", ID_B),
+                    )
+                return lines
+
+            monkeypatch.setattr(diagnostic_type, "read_lines", read_then_append)
+            assert prepared.finish().cli_session_id == ID_A
+
     @pytest.mark.parametrize(
         ("content", "message"),
         [(b"", "no conversation"), (b"I0728 partial", "partial")],
@@ -444,6 +493,46 @@ class TestAntigravityProof:
             replacement.replace(prepared.diagnostic_path)
             with pytest.raises(AntigravityBindingError, match="replaced"):
                 prepared.poll()
+
+
+def test_diagnostic_seal_ignores_later_appends(tmp_path: Path) -> None:
+    diagnostic = binding_mod._Diagnostic.create(  # pyright: ignore[reportPrivateUsage]
+        tmp_path / "runtime"
+    )
+    try:
+        with pytest.raises(AntigravityBindingError, match="sealed"):
+            diagnostic.finish()
+        _append(diagnostic.path, b"captured\n")
+        diagnostic.seal()
+        _append(diagnostic.path, b"later\n")
+        diagnostic.seal()
+
+        assert diagnostic.read_lines() == (b"captured",)
+        assert diagnostic.caught_up()
+        diagnostic.finish()
+    finally:
+        diagnostic.close()
+
+
+def test_diagnostic_sealed_read_rejects_zero_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diagnostic = binding_mod._Diagnostic.create(  # pyright: ignore[reportPrivateUsage]
+        tmp_path / "runtime"
+    )
+    try:
+        _append(diagnostic.path, b"x" * 65 + b"\n")
+        diagnostic.seal()
+        real_pread = os.pread
+
+        def stalled_pread(fd: int, length: int, offset: int) -> bytes:
+            return b"" if offset == 0 else real_pread(fd, length, offset)
+
+        monkeypatch.setattr(os, "pread", stalled_pread)
+        with pytest.raises(AntigravityBindingError, match="changed while read"):
+            diagnostic.read_lines()
+    finally:
+        diagnostic.close()
 
 
 class TestContinueCache:

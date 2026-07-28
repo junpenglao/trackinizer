@@ -19,6 +19,7 @@ import tempfile
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.transcript import (
+    FileBoundary,
     TranscriptClaim,
     TranscriptReader,
     TranscriptSnapshot,
@@ -39,6 +40,7 @@ class AntigravityBindingError(RuntimeError):
 
 _MAX_BYTES = 1 << 20
 _READ_BYTES = 64 << 10
+_TAIL_BYTES = 64
 _RESUME_MARKERS = frozenset(
     {"Resuming conversation", "Print mode: resuming conversation"}
 )
@@ -100,6 +102,7 @@ class _Diagnostic:
         self._inode = info.st_ino
         self._offset = 0
         self._buffer = bytearray()
+        self._final_boundary: FileBoundary | None = None
 
     @classmethod
     def create(cls, root: Path) -> Self:
@@ -137,12 +140,15 @@ class _Diagnostic:
     def read_lines(self) -> tuple[bytes, ...]:
         """Return newly appended complete lines after validating ownership."""
         info = self._validated_info()
-        if info.st_size < self._offset:
-            raise AntigravityBindingError("owned diagnostic shrank")
-        if self._offset < info.st_size:
+        end = (
+            self._final_boundary.size
+            if self._final_boundary is not None
+            else info.st_size
+        )
+        if self._offset < end:
             chunk = os.pread(
                 self._fd,
-                min(info.st_size - self._offset, _READ_BYTES),
+                min(end - self._offset, _READ_BYTES),
                 self._offset,
             )
             if not chunk:
@@ -162,15 +168,33 @@ class _Diagnostic:
             raise AntigravityBindingError("diagnostic record exceeds 1 MiB")
         return tuple(line[:-1] if line.endswith(b"\r") else line for line in lines)
 
-    def caught_up(self) -> bool:
-        """Whether the held descriptor has no unread bytes right now."""
+    def seal(self) -> None:
+        """Freeze the final diagnostic EOF for this provider launch."""
         info = self._validated_info()
-        if info.st_size < self._offset:
-            raise AntigravityBindingError("owned diagnostic shrank")
-        return info.st_size == self._offset
+        if self._final_boundary is None:
+            self._final_boundary = FileBoundary(
+                size=info.st_size,
+                device=info.st_dev,
+                inode=info.st_ino,
+                tail=_diagnostic_tail(self._fd, info.st_size),
+            )
+
+    def caught_up(self) -> bool:
+        """Whether the held descriptor reached its live or sealed EOF."""
+        info = self._validated_info()
+        end = (
+            self._final_boundary.size
+            if self._final_boundary is not None
+            else info.st_size
+        )
+        return end == self._offset
 
     def finish(self) -> None:
         """Reject a provider log that ends midway through a line."""
+        if self._final_boundary is None:
+            raise AntigravityBindingError("diagnostic must be sealed before finish")
+        if not self.caught_up():
+            raise AntigravityBindingError("diagnostic still has unread bytes")
         if self._buffer:
             raise AntigravityBindingError("diagnostic ends with a partial line")
 
@@ -207,6 +231,16 @@ class _Diagnostic:
         if (visible.st_dev, visible.st_ino) != (self._device, self._inode):
             raise AntigravityBindingError("owned diagnostic was replaced")
         _validate_owned_file(info, private=True, label="diagnostic")
+        if info.st_size < self._offset:
+            raise AntigravityBindingError("owned diagnostic shrank")
+        final = self._final_boundary
+        if final is not None:
+            if info.st_size < final.size:
+                raise AntigravityBindingError(
+                    "owned diagnostic shrank after final seal"
+                )
+            if _diagnostic_tail(self._fd, final.size) != final.tail:
+                raise AntigravityBindingError("owned diagnostic changed at final seal")
         return info
 
 
@@ -291,11 +325,14 @@ class PreparedAntigravity:
         if self._failure is not None:
             raise self._failure
         try:
+            self._diagnostic.seal()
             reader = self._poll()
             while not self._diagnostic.caught_up():
                 reader = self._poll()
             self._diagnostic.finish()
-            return self._require_reader(reader)
+            final_reader = self._require_reader(reader)
+            final_reader.seal()
+            return final_reader
         except Exception as err:
             self._failure = err
             raise
@@ -567,6 +604,16 @@ def _canonical_id(value: object) -> str:
     if str(parsed) != value:
         raise AntigravityBindingError("conversation identity must be a canonical UUID")
     return value
+
+
+def _diagnostic_tail(fd: int, offset: int) -> bytes:
+    size = min(offset, _TAIL_BYTES)
+    if not size:
+        return b""
+    tail = os.pread(fd, size, offset - size)
+    if len(tail) != size:
+        raise AntigravityBindingError("owned diagnostic changed while sealed")
+    return tail
 
 
 def _validate_owned_file(info: os.stat_result, *, private: bool, label: str) -> None:

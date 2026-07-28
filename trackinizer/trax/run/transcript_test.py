@@ -13,7 +13,9 @@ import sys
 
 import pytest
 
+from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
+from trackinizer.trax.run.antigravity_binding import prepare_antigravity
 from trackinizer.trax.run.transcript import (
     TranscriptClaim,
     TranscriptError,
@@ -112,6 +114,8 @@ class TestTranscriptReader:
 
         with _reader(_Adapter(root), path) as reader:
             assert reader.read_lines() == (b"system", b"user")
+            with pytest.raises(TranscriptError, match="sealed"):
+                reader.finish()
 
     def test_fragmented_line_is_emitted_once(self, tmp_path: Path) -> None:
         root = tmp_path / "sessions"
@@ -412,6 +416,9 @@ class TestTranscriptReader:
         path.write_bytes(b'{"type":')
 
         with _reader(_Adapter(root), path) as reader:
+            with pytest.raises(TranscriptError, match="sealed"):
+                reader.finish()
+            reader.seal()
             assert reader.read_lines() == ()
             with pytest.raises(TranscriptError, match="partial"):
                 reader.finish()
@@ -428,6 +435,10 @@ class TestTranscriptReader:
 
         with _reader(_Adapter(root), path) as reader:
             assert reader.read_lines() == (first,)
+            reader.seal()
+            with path.open("ab") as stream:
+                stream.write(b"later\n")
+            reader.seal()
             with pytest.raises(TranscriptError, match="unread"):
                 reader.finish()
 
@@ -435,6 +446,26 @@ class TestTranscriptReader:
             assert reader.read_lines() == (second,)
             assert reader.caught_up()
             reader.finish()
+            assert reader.read_lines() == ()
+
+    def test_sealed_read_rejects_zero_progress(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "sessions"
+        root.mkdir()
+        path = root / "native-id.jsonl"
+        path.write_bytes(b"x" * 65 + b"\n")
+
+        with _reader(_Adapter(root), path) as reader:
+            reader.seal()
+            real_pread = os.pread
+
+            def stalled_pread(fd: int, length: int, offset: int) -> bytes:
+                return b"" if offset == 0 else real_pread(fd, length, offset)
+
+            monkeypatch.setattr(os, "pread", stalled_pread)
+            with pytest.raises(TranscriptError, match="progress"):
+                reader.read_lines()
 
     def test_reads_large_suffix_in_bounded_chunks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -455,39 +486,39 @@ class TestTranscriptReader:
             assert reader.read_lines() == (b"identity",)
         assert max(requested) <= (1 << 20) + 1
 
-    def test_rejects_oversized_unterminated_record(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("terminator", [b"", b"\n"])
+    def test_rejects_oversized_record(self, tmp_path: Path, terminator: bytes) -> None:
         root = tmp_path / "sessions"
         root.mkdir()
         path = root / "native-id.jsonl"
-        path.write_bytes(b"identity\n" + b"x" * (17 << 20))
+        path.write_bytes(b"identity\n" + b"x" * ((16 << 20) + 1) + terminator)
 
         with _reader(_Adapter(root), path) as reader:
             assert reader.read_lines() == (b"identity",)
 
             def exhaust_record_limit() -> None:
-                for _ in range(17):
+                while not reader.caught_up():
                     reader.read_lines()
 
             with pytest.raises(TranscriptError, match="16 MiB"):
                 exhaust_record_limit()
 
 
-def test_exact_reader_speed_does_not_scale_with_archives(
+def test_exact_antigravity_idle_tick_does_not_scale_with_archives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One owned descriptor stays fast with 1,000 archived conversations."""
-    root = tmp_path / "sessions"
-    root.mkdir()
+    """Owned proof plus transcript stays fast with 1,000 archived sessions."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    adapter = AntigravityAdapter()
     for index in range(1_000):
-        archive = root / f"archive-{index}"
-        archive.mkdir()
-        for item in range(3):
-            (archive / f"ignored-{item}.jsonl").touch()
-    active_dir = root / "active"
-    active_dir.mkdir()
-    active = active_dir / "native-id.jsonl"
+        archived_id = f"00000000-0000-4000-8000-{index:012x}"
+        archived = adapter.transcript_path(archived_id)
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(b"archived\n")
+    identity = "88bcf1db-0fa1-4092-9b24-f7ada0920617"
+    active = adapter.transcript_path(identity)
+    active.parent.mkdir(parents=True)
     active.write_bytes(b"ready\n")
-    adapter = _Adapter(root)
 
     monkeypatch.setattr(Path, "rglob", _forbid_enumeration)
     monkeypatch.setattr(Path, "glob", _forbid_enumeration)
@@ -495,20 +526,49 @@ def test_exact_reader_speed_does_not_scale_with_archives(
     monkeypatch.setattr(os, "walk", _forbid_enumeration)
     monkeypatch.setattr(os, "scandir", _forbid_enumeration)
     monkeypatch.setattr(os, "listdir", _forbid_enumeration)
+
     started = perf_counter()
-    reader = _reader(adapter, active)
+    resumed = prepare_antigravity(
+        adapter,
+        ("--conversation", identity),
+        cwd=tmp_path,
+        runtime_root=tmp_path / "resume-runtime",
+    )
+    resume_cold_seconds = perf_counter() - started
+    resumed.close()
+
+    started = perf_counter()
+    prepared = prepare_antigravity(
+        adapter, (), cwd=tmp_path, runtime_root=tmp_path / "runtime"
+    )
     cold_seconds = perf_counter() - started
-    assert cold_seconds <= 0.050
+    assert resume_cold_seconds <= 0.005
+    assert cold_seconds <= 0.005
     try:
+        with prepared.diagnostic_path.open("ab") as stream:
+            stream.write(
+                (
+                    "I0728 09:13:40.123456 123 main.go:42] "
+                    f"Created conversation {identity}\n"
+                ).encode()
+            )
+        reader = prepared.poll()
+        assert reader is not None
         assert reader.read_lines() == (b"ready",)
         real_fstat = os.fstat
         real_stat = Path.stat
+        real_lstat = os.lstat
         metadata_calls = 0
 
         def counted_fstat(fd: int) -> os.stat_result:
             nonlocal metadata_calls
             metadata_calls += 1
             return real_fstat(fd)
+
+        def counted_lstat(path: Path) -> os.stat_result:
+            nonlocal metadata_calls
+            metadata_calls += 1
+            return real_lstat(path)
 
         def counted_stat(
             path: Path,
@@ -521,15 +581,17 @@ def test_exact_reader_speed_does_not_scale_with_archives(
 
         monkeypatch.setattr(os, "fstat", counted_fstat)
         monkeypatch.setattr(Path, "stat", counted_stat)
+        monkeypatch.setattr(Path, "lstat", counted_lstat)
         samples: list[float] = []
         per_tick_metadata: list[int] = []
         for _ in range(100):
             before = metadata_calls
             started = perf_counter()
+            assert prepared.poll() is reader
             assert reader.read_lines() == ()
             samples.append(perf_counter() - started)
             per_tick_metadata.append(metadata_calls - before)
-        assert sorted(samples)[94] <= 0.005
+        assert sorted(samples)[94] <= 0.0005
         assert max(per_tick_metadata) <= 4
     finally:
-        reader.close()
+        prepared.close()
