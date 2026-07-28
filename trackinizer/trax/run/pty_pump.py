@@ -118,10 +118,14 @@ class PtyPump:
         self._on_input = on_input
         self._master_fd = -1
         self._pid = -1
+        # Serialize PID publication, signalling, and reaping. Holding this
+        # through kill/waitpid prevents both kill(-1) and stale recycled-PID
+        # signals when a drain worker terminates the child.
+        self._child_lock = threading.Lock()
         # The child's exit status once ``_child_alive`` reaps it via WNOHANG,
-        # else None. Without this, that early reap would leave ``_reap``'s
-        # blocking ``waitpid`` with no child and it would report 0, losing the
-        # real exit code when stdin closes before the child (K1).
+        # else None. Without this, that early reap would leave ``_reap`` with
+        # no child and it would report 0, losing the real exit code when stdin
+        # closes before the child (K1).
         self._exit_status: int | None = None
         self._injected = 0
         # Serializes whole injections (paste + delay + Enter). Without it,
@@ -184,9 +188,12 @@ class PtyPump:
 
     def terminate(self) -> None:
         """Signal the child to exit (SIGTERM); safe to call repeatedly."""
-        if self._pid > 0:
+        with self._child_lock:
+            pid = self._pid
+            if pid <= 0:
+                return
             with contextlib.suppress(ProcessLookupError):
-                os.kill(self._pid, signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
 
     def run(self, *, on_started: Callable[[], None] | None = None) -> int:
         """Spawn the child and pump until it exits; return its exit status.
@@ -196,8 +203,8 @@ class PtyPump:
         ``on_started`` runs once in the parent after the fork, so callers can
         start worker threads without carrying them across ``fork``.
         """
-        self._pid, self._master_fd = pty.fork()
-        if self._pid == 0:
+        pid, master_fd = pty.fork()
+        if pid == 0:
             # Child: exec the CLI. If exec fails (permissions, ENOEXEC, ...),
             # ``_exit`` immediately -- never fall through into the parent's
             # pump code, which would leave two processes sharing the master fd.
@@ -209,6 +216,10 @@ class PtyPump:
                 os.execvp(self._argv[0], self._argv)  # noqa: S606 -- the point of `trax run`.
             except OSError:
                 os._exit(127)
+        with self._child_lock:
+            self._pid = pid
+            self._exit_status = None
+        self._master_fd = master_fd
         # From here the child is forked and exec'd onto the PTY slave; any raise
         # in terminal setup (winsize, raw mode, SIGWINCH) before or during the
         # pump must still reap it, or it leaks as a zombie (R-24). The outer
@@ -231,7 +242,7 @@ class PtyPump:
             if self._master_fd >= 0:
                 os.close(self._master_fd)
                 self._master_fd = -1
-            if self._pid > 0:
+            if self._has_child():
                 # Setup failed before ``_pump`` reaped the child (the normal
                 # path reaps via ``_reap`` and clears ``_pid``); terminate and
                 # reap it now so the child is never leaked.
@@ -320,19 +331,22 @@ class PtyPump:
 
         Reaps the child with ``WNOHANG`` and stashes its status in
         ``_exit_status`` so :meth:`_reap` can still return the real exit code:
-        this poll, not the later blocking ``waitpid``, is what collects the
-        status when stdin closes before the child.
+        this poll, not the later :meth:`_reap`, is what collects the status
+        when stdin closes before the child.
         """
-        if self._pid <= 0:
+        with self._child_lock:
+            if self._pid <= 0:
+                return False
+            try:
+                pid, status = os.waitpid(self._pid, os.WNOHANG)
+            except ChildProcessError:
+                self._pid = -1
+                return False
+            if pid == 0:
+                return True
+            self._exit_status = status
+            self._pid = -1
             return False
-        try:
-            pid, status = os.waitpid(self._pid, os.WNOHANG)
-        except ChildProcessError:
-            return False
-        if pid == 0:
-            return True
-        self._exit_status = status
-        return False
 
     def _reap(self) -> int:
         """Wait for the child and return its exit status (or 128+signal).
@@ -340,18 +354,39 @@ class PtyPump:
         Returns the status already collected by :meth:`_child_alive` when that
         poll reaped the child first. Clears ``_pid`` once reaped so a late
         :meth:`terminate` cannot ``os.kill`` a recycled, unrelated PID.
+
+        Poll without holding the lock between waits so a worker can terminate a
+        live child; each successful wait and PID invalidation remains one locked
+        transition. Adaptive backoff preserves short-child latency without
+        busy-looping when a child closes its PTY well before exit.
         """
-        status = self._exit_status
-        if status is None:
-            try:
-                _, status = os.waitpid(self._pid, 0)
-            except ChildProcessError:
-                self._pid = -1
-                return 0
-        self._pid = -1
+        poll_sec = 0.0
+        while True:
+            with self._child_lock:
+                status = self._exit_status
+                if status is not None:
+                    break
+                if self._pid <= 0:
+                    return 0
+                try:
+                    pid, status = os.waitpid(self._pid, os.WNOHANG)
+                except ChildProcessError:
+                    self._pid = -1
+                    return 0
+                if pid != 0:
+                    self._exit_status = status
+                    self._pid = -1
+                    break
+            time.sleep(poll_sec)
+            poll_sec = min(0.01, max(0.0001, poll_sec * 2))
         if os.WIFSIGNALED(status):
             return 128 + os.WTERMSIG(status)
         return os.WEXITSTATUS(status)
+
+    def _has_child(self) -> bool:
+        """Whether this pump still owns a signalable, unreaped child."""
+        with self._child_lock:
+            return self._pid > 0
 
 
 def _write_all_fd(fd: int, data: bytes) -> bool:

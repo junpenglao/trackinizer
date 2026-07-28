@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import os
 import pty
+import signal
 import struct
 import sys
 import threading
@@ -482,6 +483,119 @@ class TestPtyPumpLifecycle:
         assert pump._pid == -1
         # No ProcessLookupError, no signal to a stale/recycled PID.
         pump.terminate()
+
+    def test_terminate_snapshots_owned_pid_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reap between two PID reads must never turn kill into a broadcast."""
+        pump = PtyPump(["unused"])
+        child_pid = 42_424
+        observed: list[int] = []
+        pid_reads = iter((child_pid, -1))
+        monkeypatch.setattr(
+            PtyPump,
+            "_pid",
+            property(lambda _pump: next(pid_reads)),
+            raising=False,
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, _signal: observed.append(pid))
+
+        pump.terminate()
+
+        assert observed == [child_pid]
+
+    def test_terminate_and_reap_serialize_owned_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A child cannot be reaped and recycled during its signal syscall."""
+        pump = PtyPump(["unused"])
+        child_pid = 42_424
+        with pump._child_lock:
+            pump._pid = child_pid
+
+        reaper_started = threading.Event()
+        waitpid_entered = threading.Event()
+        signals: list[tuple[int, int]] = []
+        result: list[int] = []
+        reapers: list[threading.Thread] = []
+
+        def controlled_waitpid(pid: int, options: int) -> tuple[int, int]:
+            assert pump._child_lock.locked()
+            assert (pid, options) == (child_pid, os.WNOHANG)
+            waitpid_entered.set()
+            return (pid, 0)
+
+        def reap() -> None:
+            reaper_started.set()
+            result.append(pump._reap())
+
+        def record_kill(pid: int, signum: int) -> None:
+            assert pump._child_lock.locked()
+            reaper = threading.Thread(target=reap)
+            reapers.append(reaper)
+            reaper.start()
+            assert reaper_started.wait(2.0)
+            assert not waitpid_entered.is_set()
+            signals.append((pid, signum))
+
+        monkeypatch.setattr(os, "waitpid", controlled_waitpid)
+        monkeypatch.setattr(os, "kill", record_kill)
+
+        pump.terminate()
+
+        assert len(reapers) == 1
+        reapers[0].join(timeout=2.0)
+        assert not reapers[0].is_alive()
+        assert waitpid_entered.is_set()
+        assert signals == [(child_pid, signal.SIGTERM)]
+        assert result == [0]
+        assert pump._pid == -1
+
+    def test_reap_unlocks_between_live_child_polls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live child remains terminable after closing its PTY."""
+        pump = PtyPump(["unused"])
+        child_pid = 42_424
+        with pump._child_lock:
+            pump._pid = child_pid
+
+        paused = threading.Event()
+        resume = threading.Event()
+        lock_states: list[bool] = []
+        signals: list[int] = []
+        result: list[int] = []
+        polls = 0
+
+        def controlled_waitpid(pid: int, options: int) -> tuple[int, int]:
+            nonlocal polls
+            assert pump._child_lock.locked()
+            assert (pid, options) == (child_pid, os.WNOHANG)
+            polls += 1
+            return (0, 0) if polls == 1 else (pid, 0)
+
+        def pause_between_polls(_seconds: float) -> None:
+            lock_states.append(pump._child_lock.locked())
+            paused.set()
+            assert resume.wait(2.0)
+
+        monkeypatch.setattr(os, "waitpid", controlled_waitpid)
+        monkeypatch.setattr(os, "kill", lambda pid, _signal: signals.append(pid))
+        monkeypatch.setattr(time, "sleep", pause_between_polls)
+        reaper = threading.Thread(target=lambda: result.append(pump._reap()))
+        reaper.start()
+        assert paused.wait(2.0)
+
+        try:
+            assert lock_states == [False]
+            pump.terminate()
+        finally:
+            resume.set()
+            reaper.join(timeout=2.0)
+
+        assert not reaper.is_alive()
+        assert signals == [child_pid]
+        assert result == [0]
 
     def test_setup_failure_after_fork_reaps_the_child(
         self, monkeypatch: pytest.MonkeyPatch
