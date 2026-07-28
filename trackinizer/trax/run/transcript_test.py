@@ -416,6 +416,26 @@ class TestTranscriptReader:
             with pytest.raises(TranscriptError, match="partial"):
                 reader.finish()
 
+    def test_finish_requires_every_complete_record_to_be_drained(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "sessions"
+        root.mkdir()
+        path = root / "native-id.jsonl"
+        first = b"a" * 700_000
+        second = b"b" * 700_000
+        path.write_bytes(first + b"\n" + second + b"\n")
+
+        with _reader(_Adapter(root), path) as reader:
+            assert reader.read_lines() == (first,)
+            with pytest.raises(TranscriptError, match="unread"):
+                reader.finish()
+
+            assert not reader.caught_up()
+            assert reader.read_lines() == (second,)
+            assert reader.caught_up()
+            reader.finish()
+
     def test_reads_large_suffix_in_bounded_chunks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

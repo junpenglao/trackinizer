@@ -173,16 +173,7 @@ class TranscriptReader:
 
     def read_lines(self) -> tuple[bytes, ...]:
         """Read the current suffix and return complete, unreplayed records."""
-        if self._fd < 0:
-            raise TranscriptError("transcript reader is closed")
-        info = os.fstat(self._fd)
-        if (info.st_dev, info.st_ino) != (self._device, self._inode):
-            raise TranscriptError("owned transcript descriptor changed identity")
-        _verify_path_identity(self._path, info)
-        _validate_file(info)
-        if info.st_size < self._offset:
-            raise TranscriptError("owned transcript shrunk after binding")
-        _verify_tail(self._fd, self._offset, self._guard)
+        info = self._validated_info()
         if info.st_size > self._offset:
             read_size = min(info.st_size - self._offset, _READ_BYTES)
             chunk = os.pread(self._fd, read_size, self._offset)
@@ -202,8 +193,28 @@ class TranscriptReader:
             if line.strip():
                 lines.append(line)
 
+    def caught_up(self) -> bool:
+        """Whether every byte currently in the owned transcript was read."""
+        return self._validated_info().st_size == self._offset
+
+    def _validated_info(self) -> os.stat_result:
+        """Validate the retained transcript and return its current metadata."""
+        if self._fd < 0:
+            raise TranscriptError("transcript reader is closed")
+        info = os.fstat(self._fd)
+        if (info.st_dev, info.st_ino) != (self._device, self._inode):
+            raise TranscriptError("owned transcript descriptor changed identity")
+        _verify_path_identity(self._path, info)
+        _validate_file(info)
+        if info.st_size < self._offset:
+            raise TranscriptError("owned transcript shrunk after binding")
+        _verify_tail(self._fd, self._offset, self._guard)
+        return info
+
     def finish(self) -> None:
-        """Fail visibly if the provider exits midway through a JSONL record."""
+        """Require a fully drained transcript ending at a record boundary."""
+        if not self.caught_up():
+            raise TranscriptError("transcript still has unread bytes")
         if self._buffer.strip():
             raise TranscriptError("transcript ends with a partial JSONL record")
         self._buffer.clear()
