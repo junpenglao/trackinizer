@@ -416,6 +416,36 @@ class TestPtyPumpLifecycle:
         assert PtyPump(["true"]).run() == 0
         assert PtyPump(["false"]).run() == 1
 
+    def test_started_callback_runs_in_parent_after_fork(self) -> None:
+        parent_pid = os.getpid()
+        observed: list[tuple[int, int, int]] = []
+        pump = PtyPump(["true"])
+
+        def started() -> None:
+            observed.append((os.getpid(), pump._pid, pump._master_fd))
+
+        assert pump.run(on_started=started) == 0
+        assert len(observed) == 1
+        callback_pid, child_pid, master_fd = observed[0]
+        assert callback_pid == parent_pid
+        assert child_pid > 0
+        assert master_fd >= 0
+
+    def test_started_callback_failure_reaps_child(self) -> None:
+        pump = PtyPump([sys.executable, "-c", "import time; time.sleep(30)"])
+
+        def fail() -> None:
+            raise RuntimeError("worker startup failed")
+
+        message = ""
+        try:
+            pump.run(on_started=fail)
+        except RuntimeError as err:
+            message = str(err)
+        assert "worker startup" in message
+        assert pump._pid == -1
+        assert pump._master_fd == -1
+
     def test_exit_code_survives_child_alive_poll(self) -> None:
         """``_child_alive`` must not discard the child's exit status.
 

@@ -188,11 +188,13 @@ class PtyPump:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(self._pid, signal.SIGTERM)
 
-    def run(self) -> int:
+    def run(self, *, on_started: Callable[[], None] | None = None) -> int:
         """Spawn the child and pump until it exits; return its exit status.
 
         Sets the real terminal raw for the child's lifetime, forwards window
         size and ``SIGWINCH``, and restores the terminal on exit.
+        ``on_started`` runs once in the parent after the fork, so callers can
+        start worker threads without carrying them across ``fork``.
         """
         self._pid, self._master_fd = pty.fork()
         if self._pid == 0:
@@ -212,6 +214,8 @@ class PtyPump:
         # pump must still reap it, or it leaks as a zombie (R-24). The outer
         # ``finally`` terminates and reaps the child on every exit path.
         try:
+            if on_started is not None:
+                on_started()
             self._sync_winsize()
             stdin_fd = _real_fd(sys.stdin)
             out_fd = _real_fd(sys.stdout)
