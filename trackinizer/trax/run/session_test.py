@@ -37,6 +37,7 @@ from trackinizer.trax.run.session import (
     run,
 )
 from trackinizer.types.agent_session_events import (
+    AssistantMessage,
     SlashCommand,
     UserMessage,
 )
@@ -105,8 +106,8 @@ class _FakeAdapter:
 class _WholeFileAdapter:
     """A whole-file adapter: the runner must feed it the entire file body.
 
-    Mirrors Antigravity, which rewrites one JSON object in place rather than
-    appending lines. ``parse`` reads ``messages[-1]`` from the whole body.
+    Models a CLI that rewrites one JSON object in place rather than appending
+    lines. ``parse`` reads ``messages[-1]`` from the whole body.
     """
 
     name: str = "wholefile"
@@ -267,8 +268,94 @@ class TestSessionScoping:
         assert stats.counts == {"UserMessage": 3}
 
 
+class TestAntigravityLineDrain:
+    def test_canonical_transcript_appends_without_replay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        conversation_id = "88bcf1db-0fa1-4092-9b24-f7ada0920617"
+        transcript = (
+            tmp_path
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / conversation_id
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        first = (
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-07-20T06:52:03Z",
+                    "content": "first",
+                }
+            )
+            + "\n"
+        ).encode()
+        transcript.write_bytes(first)
+
+        adapter = AntigravityAdapter()
+        sink = _RecordingSink()
+        stats = _Stats()
+        config = RunConfig(cli_name="agy")
+        offsets: dict[Path, int] = {}
+        buffers: dict[Path, bytearray] = {}
+
+        def scan() -> None:
+            _scan_and_read(
+                adapter,
+                sink,
+                stats,
+                config,
+                offsets,
+                buffers=buffers,
+                baseline=frozenset(),
+            )
+
+        scan()
+        second = (
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-07-20T06:52:04Z",
+                    "content": "second",
+                }
+            )
+            + "\n"
+        ).encode()
+        split = len(second) // 2
+        with transcript.open("ab") as stream:
+            stream.write(second[:split])
+        scan()
+        assert len(sink.events) == 1
+
+        with transcript.open("ab") as stream:
+            stream.write(second[split:])
+        scan()
+        scan()  # An idle poll must not replay either completed line.
+
+        assert sink.cli_session_ids
+        assert set(sink.cli_session_ids) == {conversation_id}
+        assert len(sink.events) == 2
+        first_message = sink.events[0][2].message
+        second_message = sink.events[1][2].message
+        assert isinstance(first_message, UserMessage)
+        assert first_message.text == "first"
+        assert isinstance(second_message, AssistantMessage)
+        assert second_message.text == "second"
+
+
 class TestWholeFileDrain:
-    """A whole-file adapter (Antigravity) must receive the entire file, re-read."""
+    """A whole-file adapter must receive the entire file and be re-read."""
 
     def test_in_place_rewrite_emits_event(self, tmp_path: Path) -> None:
         log = tmp_path / "session-x.json"
@@ -287,11 +374,9 @@ class TestWholeFileDrain:
     def test_same_size_rewrite_emits_event(self, tmp_path: Path) -> None:
         """A whole-file rewrite to identical byte size still emits an event.
 
-        Antigravity rewrites one JSON object in place; a same-length edit (the new
-        message has the same byte count as the old) keeps ``st_size``
-        unchanged. Tracking size alone makes the second scan skip the re-read,
-        dropping the new turn. The drain must detect the change via mtime or
-        content, not size alone.
+        A same-length edit keeps ``st_size`` unchanged. Tracking size alone
+        makes the second scan skip the re-read, dropping the new turn. The
+        drain must detect the change via mtime or content, not size alone.
         """
         log = tmp_path / "session-x.json"
         # Two payloads with the same single-character last message: identical
@@ -336,59 +421,6 @@ class TestWholeFileDrain:
             "a",
             "b",
         ]
-
-
-class TestAntigravityMultiFileDrain:
-    """One AntigravityAdapter draining multiple session files keeps cursors apart.
-
-    #498: the runner reuses ONE adapter across every matching session file.
-    A per-adapter message cursor carried one file's count into the next, so a
-    second agy session file's turns were dropped. Drive the real adapter
-    through ``_scan_and_read`` over two on-disk agy session files and assert
-    every turn of both surfaces.
-    """
-
-    def test_two_session_files_both_fully_drained(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # A fake $HOME whose ``.gemini/tmp/<sha>/chats`` holds two session
-        # files, each two messages. ``_tmp_dir`` resolves ``Path.home()``.
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        chats = tmp_path / ".gemini" / "tmp" / "deadbeef" / "chats"
-        chats.mkdir(parents=True)
-
-        def _session(name: str, session_id: str, msgs: list[str]) -> None:
-            (chats / name).write_text(
-                json.dumps(
-                    {
-                        "sessionId": session_id,
-                        "messages": [{"type": "user", "content": m} for m in msgs],
-                    }
-                )
-            )
-
-        _session("session-1.json", "sess-A", ["a-q", "a-r"])
-        _session("session-2.json", "sess-B", ["b-q", "b-r"])
-
-        adapter = AntigravityAdapter()  # ONE adapter for both files, like the runner
-        sink = _RecordingSink()
-        stats = _Stats()
-        config = RunConfig(cli_name="agy")
-        stamps: dict[Path, tuple[int, int]] = {}
-        _scan_and_read(
-            cast(Adapter, adapter),
-            sink,
-            stats,
-            config,
-            {},
-            buffers={},
-            baseline=frozenset(),
-            stamps=stamps,
-        )
-
-        texts = sorted(cast("UserMessage", e.message).text for _, _, e in sink.events)
-        # All four turns from both files, none dropped by a shared cursor.
-        assert texts == ["a-q", "a-r", "b-q", "b-r"]
 
 
 class TestDrainSurvivesParseError:
@@ -617,7 +649,7 @@ class TestDryRunDrain:
     """The dry-run replay must dispatch each adapter by its drain shape."""
 
     def test_whole_file_adapter_emits_existing_body(self, tmp_path: Path) -> None:
-        """Dry-run on a whole-file (Antigravity) session re-reads and emits its turn.
+        """Dry-run on a whole-file session re-reads and emits its turn.
 
         K3: dry-run used to feed every adapter through ``tail``'s line-split
         (``whole_file=False``), so a whole-file JSON body never parsed and no

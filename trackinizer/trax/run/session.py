@@ -671,9 +671,8 @@ def _drain_file(
 ) -> None:
     """Emit events for one file's new content, by the adapter's drain shape.
 
-    Whole-file adapters (Antigravity rewrites one JSON object in place) get the
-    entire body re-read on each change; line adapters (claude / codex append
-    JSONL) follow a byte offset and emit per newline-terminated line.
+    Whole-file adapters get the entire body re-read on each change; line
+    adapters follow a byte offset and emit per newline-terminated line.
     """
     if adapter.whole_file:
         _drain_whole_file(path, adapter, sink, stats, config, stamps=stamps)
@@ -696,9 +695,8 @@ def _drain_whole_file(
 
     ``stamps`` records the last seen ``(size, mtime_ns)`` per file; an
     unchanged stamp skips the re-read so an idle file is not reparsed every
-    poll. Tracking mtime alongside size is what catches a same-length rewrite
-    (an Antigravity in-place edit to identical byte size), which a size-only check
-    would silently drop.
+    poll. Tracking mtime alongside size is what catches an in-place edit to
+    identical byte size, which a size-only check would silently drop.
     """
     try:
         info = path.stat()
@@ -805,11 +803,11 @@ def _dry_run_drain(
     """The ``--dry-run`` loop: replay existing session files until Ctrl-C.
 
     Polls the adapter's session dirs with the same per-shape dispatch as the
-    live drain (:func:`_scan_and_read`), so a whole-file adapter (Antigravity) is
-    re-read whole and a line adapter follows byte offsets -- unlike the old
-    ``tail -F`` path, which line-split every adapter and so could never parse a
-    whole-file JSON body. The baseline is empty (dry-run *replays* existing
-    files, the point of an offline session review).
+    live drain (:func:`_scan_and_read`), so a whole-file adapter is re-read
+    whole and a line adapter follows byte offsets -- unlike the old ``tail -F``
+    path, which line-split every adapter and so could never parse a whole-file
+    JSON body. The baseline is empty (dry-run *replays* existing files, the
+    point of an offline session review).
 
     ``stop`` ends the loop (tests inject it); in a real run it is ``None`` and
     a ``KeyboardInterrupt`` (Ctrl-C) ends it instead. Either way a final sweep

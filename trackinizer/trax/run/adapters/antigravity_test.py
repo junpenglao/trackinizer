@@ -1,108 +1,426 @@
-"""Tests for the Antigravity adapter: session-shape fixtures → typed messages."""
+"""Tests for Antigravity: sanitized transcript fixtures to typed messages."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 import json
+
+
+if TYPE_CHECKING:
+    import pytest
 
 from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Event
 from trackinizer.types.agent_session_events import (
     AssistantMessage,
-    Message,
+    Compaction,
+    SystemMessage,
+    ToolResult,
     UnknownMessage,
     UserMessage,
 )
 
 
-def _text(message: Message) -> str:
-    """The ``text`` of a user/assistant turn; asserts the member carries one."""
-    assert isinstance(message, (UserMessage, AssistantMessage))
-    return message.text
+CONVERSATION_ID = "88bcf1db-0fa1-4092-9b24-f7ada0920617"
 
 
 def _encode(obj: object) -> bytes:
-    return json.dumps(obj).encode()
+    return (json.dumps(obj) + "\n").encode()
 
 
 def _parse_one(raw: bytes) -> Event | None:
-    """The single event for a whole-file body, or ``None`` when skipped.
-
-    A fresh adapter per call: the adapter tracks the per-file emitted-message
-    count to emit only newly-appended messages (REV-004), so a stale count
-    from a prior single-body case must not bleed into the next.
-    """
-    events = list(AntigravityAdapter().parse(raw, whole_file=True))
+    events = list(AntigravityAdapter().parse(raw, whole_file=False))
     assert len(events) <= 1, events
     return events[0] if events else None
 
 
-class TestAntigravityParseLine:
-    def test_empty_messages_is_skipped(self) -> None:
-        line = _encode({"sessionId": "x", "messages": []})
-        assert _parse_one(line) is None
+def _record(
+    *,
+    step_index: object,
+    source: str,
+    record_type: str,
+    status: str = "DONE",
+    created_at: str = "2026-07-20T06:52:03Z",
+    **payload: object,
+) -> bytes:
+    """A sanitized Antigravity 1.1.7 ``transcript_full.jsonl`` record."""
+    return _encode(
+        {
+            "step_index": step_index,
+            "source": source,
+            "type": record_type,
+            "status": status,
+            "created_at": created_at,
+            **payload,
+        }
+    )
 
-    def test_missing_messages_is_skipped(self) -> None:
-        line = _encode({"sessionId": "x"})
-        assert _parse_one(line) is None
 
-    def test_user_message(self) -> None:
-        line = _encode(
-            {
-                "sessionId": "x",
-                "messages": [{"type": "user", "content": "hi"}],
-            }
+class TestAntigravityTranscriptPath:
+    def test_session_dirs_returns_global_brain_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        adapter = AntigravityAdapter()
+        assert tuple(adapter.session_dirs()) == ()
+
+        brain = tmp_path / ".gemini" / "antigravity-cli" / "brain"
+        brain.mkdir(parents=True)
+        assert tuple(adapter.session_dirs()) == (brain,)
+
+    def test_matches_only_full_transcript_at_exact_conversation_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        adapter = AntigravityAdapter()
+        logs = (
+            tmp_path
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / CONVERSATION_ID
+            / ".system_generated"
+            / "logs"
         )
-        event = _parse_one(line)
+
+        assert adapter.matches_session_file(logs / "transcript_full.jsonl")
+        # Antigravity writes this truncated mirror beside the full transcript.
+        # Matching both would duplicate every turn.
+        assert not adapter.matches_session_file(logs / "transcript.jsonl")
+        assert not adapter.matches_session_file(logs / "other.jsonl")
+
+    def test_rejects_wrong_root_shape_and_noncanonical_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        adapter = AntigravityAdapter()
+        brain = tmp_path / ".gemini" / "antigravity-cli" / "brain"
+
+        assert not adapter.matches_session_file(
+            brain
+            / "not-a-conversation-id"
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+        assert not adapter.matches_session_file(
+            brain / CONVERSATION_ID / "logs" / "transcript_full.jsonl"
+        )
+        assert not adapter.matches_session_file(
+            brain
+            / CONVERSATION_ID.upper()
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+        assert not adapter.matches_session_file(
+            tmp_path
+            / "elsewhere"
+            / CONVERSATION_ID
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+
+    def test_extracts_exact_native_conversation_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        adapter = AntigravityAdapter()
+        path = (
+            tmp_path
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / CONVERSATION_ID
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+        assert adapter.session_id_from_path(path) == CONVERSATION_ID
+        assert adapter.session_id_from_path(path.with_name("transcript.jsonl")) is None
+
+    def test_rejects_symlinked_transcript(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        logs = (
+            tmp_path
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / CONVERSATION_ID
+            / ".system_generated"
+            / "logs"
+        )
+        logs.mkdir(parents=True)
+        outside = tmp_path / "outside.jsonl"
+        outside.write_text("{}\n")
+        transcript = logs / "transcript_full.jsonl"
+        transcript.symlink_to(outside)
+
+        adapter = AntigravityAdapter()
+        assert not adapter.matches_session_file(transcript)
+        assert adapter.session_id_from_path(transcript) is None
+
+    def test_rejects_symlinked_conversation_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        brain = tmp_path / ".gemini" / "antigravity-cli" / "brain"
+        brain.mkdir(parents=True)
+        outside = tmp_path / "outside-conversation"
+        logs = outside / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript_full.jsonl").write_text("{}\n")
+        (brain / CONVERSATION_ID).symlink_to(outside, target_is_directory=True)
+        transcript = (
+            brain
+            / CONVERSATION_ID
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
+
+        adapter = AntigravityAdapter()
+        assert not adapter.matches_session_file(transcript)
+        assert adapter.session_id_from_path(transcript) is None
+
+
+class TestAntigravityParseLine:
+    def test_user_input_is_user_message_with_timestamp(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=0,
+                source="USER_EXPLICIT",
+                record_type="USER_INPUT",
+                content="Investigate the sampler.",
+            )
+        )
         assert event is not None
         assert isinstance(event.message, UserMessage)
-        assert event.message.text == "hi"
+        assert event.message.text == "Investigate the sampler."
+        assert event.timestamp == datetime(2026, 7, 20, 6, 52, 3, tzinfo=UTC)
 
-    def test_assistant_message(self) -> None:
-        line = _encode(
-            {
-                "sessionId": "x",
-                "messages": [
-                    {"type": "user", "content": "hi"},
-                    {"type": "agy", "content": "hi back"},
-                ],
-            }
+    def test_planner_response_is_one_assistant_turn(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=3,
+                source="MODEL",
+                record_type="PLANNER_RESPONSE",
+                content="I found the cause.",
+                thinking="Compare both implementations.",
+            )
         )
-        # A fresh body's first parse emits every message in order (REV-004):
-        # the user prompt then the agy reply.
-        events = list(AntigravityAdapter().parse(line, whole_file=True))
-        assert isinstance(events[0].message, UserMessage)
-        assert isinstance(events[1].message, AssistantMessage)
-        assert events[1].message.text == "hi back"
-
-    def test_assistant_message_with_tool_calls(self) -> None:
-        line = _encode(
-            {
-                "sessionId": "x",
-                "messages": [
-                    {
-                        "type": "agy",
-                        "content": "running",
-                        "toolCalls": [
-                            {"id": "t1", "name": "read_file", "args": {"path": "x"}}
-                        ],
-                    },
-                ],
-            }
-        )
-        event = _parse_one(line)
         assert event is not None
         assert isinstance(event.message, AssistantMessage)
-        assert len(event.message.tool_calls) == 1
-        call = event.message.tool_calls[0]
-        assert call.id == "t1"
-        assert call.name == "read_file"
-        assert call.args == {"path": "x"}
+        assert event.message.text == "I found the cause."
+        assert event.message.thinking == "Compare both implementations."
 
-    def test_unrecognized_type_is_unknown(self) -> None:
-        line = _encode(
-            {"sessionId": "x", "messages": [{"type": "system", "content": "x"}]}
+    def test_generic_record_stays_unknown_despite_preceding_tool_call(self) -> None:
+        adapter = AntigravityAdapter()
+        call_events = list(
+            adapter.parse(
+                _record(
+                    step_index=2,
+                    source="MODEL",
+                    record_type="PLANNER_RESPONSE",
+                    tool_calls=[{"name": "list_permissions", "args": {}}],
+                ),
+                whole_file=False,
+            )
         )
-        event = _parse_one(line)
+        result_events = list(
+            adapter.parse(
+                _record(
+                    step_index=3,
+                    source="MODEL",
+                    record_type="GENERIC",
+                    content="permission result",
+                ),
+                whole_file=False,
+            )
+        )
+
+        assert len(call_events) == 1
+        call_message = call_events[0].message
+        assert isinstance(call_message, AssistantMessage)
+        assert call_message.tool_calls[0].id == "agy-step-3"
+        assert len(result_events) == 1
+        result_message = result_events[0].message
+        # GENERIC is result-shaped in the observed corpus, but has no stable
+        # provider discriminator. Preserve it raw instead of sharing parser
+        # context across independently drained transcript files.
+        assert isinstance(result_message, UnknownMessage)
+
+    def test_tool_call_and_result_share_provider_step_identity(self) -> None:
+        call_event = _parse_one(
+            _record(
+                step_index=7,
+                source="MODEL",
+                record_type="PLANNER_RESPONSE",
+                thinking="Run the focused test.",
+                tool_calls=[
+                    {
+                        "name": "run_command",
+                        "args": {
+                            "CommandLine": "pytest -q sampler_test.py",
+                            "Cwd": "/workspace",
+                            "toolAction": "Run",
+                            "toolSummary": "Focused tests",
+                        },
+                    }
+                ],
+            )
+        )
+        result_event = _parse_one(
+            _record(
+                step_index=8,
+                source="MODEL",
+                record_type="RUN_COMMAND",
+                content="1 passed",
+            )
+        )
+
+        assert call_event is not None
+        assert isinstance(call_event.message, AssistantMessage)
+        assert call_event.message.thinking == "Run the focused test."
+        assert len(call_event.message.tool_calls) == 1
+        call = call_event.message.tool_calls[0]
+        assert call.id == "agy-step-8"
+        assert call.name == "run_command"
+        assert call.args["CommandLine"] == "pytest -q sampler_test.py"
+
+        assert result_event is not None
+        assert isinstance(result_event.message, ToolResult)
+        assert result_event.message.call_id == call.id
+        assert result_event.message.content == "1 passed"
+        assert result_event.message.is_error is False
+
+    def test_failed_tool_result_is_marked_as_error(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=8,
+                source="MODEL",
+                record_type="RUN_COMMAND",
+                status="FAILED",
+                content="command failed",
+            )
+        )
+        assert event is not None
+        assert isinstance(event.message, ToolResult)
+        assert event.message.is_error is True
+
+    def test_running_tool_record_is_preserved_as_unknown(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=8,
+                source="MODEL",
+                record_type="RUN_COMMAND",
+                status="RUNNING",
+                content="command still running",
+            )
+        )
+        assert event is not None
+        assert isinstance(event.message, UnknownMessage)
+
+    def test_each_observed_tool_result_type_is_normalized(self) -> None:
+        for record_type in (
+            "CODE_ACTION",
+            "LIST_DIRECTORY",
+            "RUN_COMMAND",
+            "VIEW_FILE",
+        ):
+            event = _parse_one(
+                _record(
+                    step_index=12,
+                    source="MODEL",
+                    record_type=record_type,
+                    content=f"{record_type} result",
+                )
+            )
+            assert event is not None
+            assert isinstance(event.message, ToolResult), record_type
+            assert event.message.call_id == "agy-step-12"
+
+    def test_invalid_step_index_does_not_forge_tool_identity(self) -> None:
+        for invalid in (None, True, "7", -1):
+            event = _parse_one(
+                _record(
+                    step_index=invalid,
+                    source="MODEL",
+                    record_type="RUN_COMMAND",
+                    content="result",
+                )
+            )
+            assert event is not None
+            assert isinstance(event.message, UnknownMessage), invalid
+
+    def test_multiple_tool_calls_do_not_invent_future_step_ids(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=7,
+                source="MODEL",
+                record_type="PLANNER_RESPONSE",
+                tool_calls=[
+                    {"name": "first", "args": {}},
+                    {"name": "second", "args": {}},
+                ],
+            )
+        )
+        assert event is not None
+        assert isinstance(event.message, UnknownMessage)
+
+    def test_checkpoint_is_compaction(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=4,
+                source="SYSTEM",
+                record_type="CHECKPOINT",
+                content="Condensed conversation state.",
+            )
+        )
+        assert event is not None
+        assert isinstance(event.message, Compaction)
+        assert event.message.text == "Condensed conversation state."
+
+    def test_system_message_is_system_context(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=5,
+                source="SYSTEM",
+                record_type="SYSTEM_MESSAGE",
+                content="The background command is still running.",
+            )
+        )
+        assert event is not None
+        assert isinstance(event.message, SystemMessage)
+        assert event.message.text == "The background command is still running."
+
+    def test_empty_conversation_history_marker_is_skipped(self) -> None:
+        assert (
+            _parse_one(
+                _record(
+                    step_index=1,
+                    source="SYSTEM",
+                    record_type="CONVERSATION_HISTORY",
+                )
+            )
+            is None
+        )
+
+    def test_unrecognized_record_is_unknown(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=9,
+                source="MODEL",
+                record_type="FUTURE_STEP",
+                content="new shape",
+            )
+        )
         assert event is not None
         assert isinstance(event.message, UnknownMessage)
 
@@ -110,152 +428,23 @@ class TestAntigravityParseLine:
         assert _parse_one(b"{not json}") is None
 
     def test_non_dict_returns_none(self) -> None:
-        assert _parse_one(b"[1, 2, 3]") is None
+        assert _parse_one(b"[]") is None
 
-    def test_is_whole_file_adapter(self) -> None:
-        """Antigravity rewrites its session in place; it must declare whole-file."""
-        assert AntigravityAdapter().whole_file is True
-
-    def test_parse_whole_file_emits_latest_message(self) -> None:
-        line = _encode(
-            {"sessionId": "x", "messages": [{"type": "user", "content": "hi"}]}
-        )
-        events = list(AntigravityAdapter().parse(line, whole_file=True))
-        assert len(events) == 1
-        assert isinstance(events[0].message, UserMessage)
-        assert events[0].message.text == "hi"
-
-
-class TestAntigravityEmitsAppendedSlice:
-    """Multiple messages appended between polls must all emit, in order.
-
-    REV-004/R-20: agy rewrites its whole session JSON in place. The adapter
-    emitted only ``messages[-1]`` per parse, so when N messages appeared
-    between two polls (a burst, or a tool call + reply landing together) the
-    N-1 earlier ones were dropped. The adapter must track the prior message
-    count per file and emit only the newly-appended slice, in order.
-    """
-
-    def test_burst_of_new_messages_all_emit_in_order(self) -> None:
-        # A fresh adapter (per-run state must not leak across runs).
-        fresh = AntigravityAdapter()
-        first = _encode(
-            {"sessionId": "x", "messages": [{"type": "user", "content": "q1"}]}
-        )
-        events = list(fresh.parse(first, whole_file=True))
-        assert [_text(e.message) for e in events] == ["q1"]
-
-        # Three messages appear before the next poll: a reply, a follow-up
-        # question, and a second reply. All three must surface, in order.
-        second = _encode(
-            {
-                "sessionId": "x",
-                "messages": [
-                    {"type": "user", "content": "q1"},
-                    {"type": "agy", "content": "a1"},
-                    {"type": "user", "content": "q2"},
-                    {"type": "agy", "content": "a2"},
-                ],
-            }
-        )
-        events = list(fresh.parse(second, whole_file=True))
-        assert [_text(e.message) for e in events] == ["a1", "q2", "a2"]
-
-    def test_unchanged_message_list_emits_nothing(self) -> None:
-        # A re-parse of an unchanged body (the runner can re-feed) emits no
-        # duplicate: the prior count already covers every message.
-        fresh = AntigravityAdapter()
-        body = _encode(
-            {"sessionId": "x", "messages": [{"type": "user", "content": "only"}]}
-        )
-        assert [_text(e.message) for e in fresh.parse(body, whole_file=True)] == [
-            "only"
-        ]
-        assert list(fresh.parse(body, whole_file=True)) == []
-
-    def test_cursor_is_per_session_file_not_per_adapter(self) -> None:
-        """One adapter draining several session files must not cross their cursors.
-
-        #498: the runner reuses ONE ``AntigravityAdapter`` across every matching
-        session file (``_scan_and_read``). A single ``_emitted`` counter then
-        carried file A's count into file B: parsing B (2 msgs) yielded
-        ``messages[2:] == []`` and B's turns were dropped. The cursor must be
-        keyed per session file, so each file's appended slice is independent.
-        """
-        adapter = AntigravityAdapter()
-        file_a = _encode(
-            {
-                "sessionId": "sess-A",
-                "messages": [
-                    {"type": "user", "content": "a-q"},
-                    {"type": "agy", "content": "a-r"},
-                ],
-            }
-        )
-        file_b = _encode(
-            {
-                "sessionId": "sess-B",
-                "messages": [
-                    {"type": "user", "content": "b-q"},
-                    {"type": "agy", "content": "b-r"},
-                ],
-            }
-        )
-        # Same adapter parses A then B (the runner's per-poll order over files).
-        events_a = [_text(e.message) for e in adapter.parse(file_a, whole_file=True)]
-        events_b = [_text(e.message) for e in adapter.parse(file_b, whole_file=True)]
-        assert events_a == ["a-q", "a-r"]
-        # File B's cursor is independent of A's: both its messages emit.
-        assert events_b == ["b-q", "b-r"]
-
-    def test_interleaved_files_each_advance_independently(self) -> None:
-        """Polling two growing files in turn advances each cursor on its own.
-
-        The runner re-reads every file each poll, so A and B are parsed
-        alternately as both grow. Each file must emit only its own newly-
-        appended messages, never re-emit and never skip across the other file.
-        """
-        adapter = AntigravityAdapter()
-
-        def body(session: str, contents: list[str]) -> bytes:
-            return _encode(
-                {
-                    "sessionId": session,
-                    "messages": [{"type": "user", "content": c} for c in contents],
-                }
+    def test_invalid_timestamp_is_ignored(self) -> None:
+        event = _parse_one(
+            _record(
+                step_index=0,
+                source="USER_EXPLICIT",
+                record_type="USER_INPUT",
+                created_at="not-a-timestamp",
+                content="hello",
             )
+        )
+        assert event is not None
+        assert event.timestamp is None
 
-        def texts(session: str, contents: list[str]) -> list[str]:
-            events = adapter.parse(body(session, contents), whole_file=True)
-            return [_text(e.message) for e in events]
-
-        # Poll 1: A has one message, B has one.
-        assert texts("A", ["a1"]) == ["a1"]
-        assert texts("B", ["b1"]) == ["b1"]
-        # Poll 2: A grew by one; B unchanged.
-        assert texts("A", ["a1", "a2"]) == ["a2"]
-        assert texts("B", ["b1"]) == []
-        # Poll 3: B grew by one; A unchanged.
-        assert texts("A", ["a1", "a2"]) == []
-        assert texts("B", ["b1", "b2"]) == ["b2"]
-
-    def test_keyless_files_do_not_share_a_cursor(self) -> None:
-        """Two bodies with no ``sessionId`` must not collide on a shared cursor.
-
-        K6-002: keyless bodies all mapped to the ``""`` key, so a second
-        no-sessionId file's first message was treated as already-emitted by the
-        first file's cursor and dropped. A keyless body must emit every message
-        it carries rather than silently dropping turns.
-        """
-        adapter = AntigravityAdapter()
-        # Neither body carries a ``sessionId`` (malformed / pre-id agy file).
-        file_a = _encode({"messages": [{"type": "user", "content": "a-only"}]})
-        file_b = _encode({"messages": [{"type": "user", "content": "b-only"}]})
-        events_a = [_text(e.message) for e in adapter.parse(file_a, whole_file=True)]
-        events_b = [_text(e.message) for e in adapter.parse(file_b, whole_file=True)]
-        assert events_a == ["a-only"]
-        # File B's first message must NOT be swallowed by file A's cursor.
-        assert events_b == ["b-only"]
+    def test_is_append_only_line_adapter(self) -> None:
+        assert AntigravityAdapter().whole_file is False
 
 
 if __name__ == "__main__":

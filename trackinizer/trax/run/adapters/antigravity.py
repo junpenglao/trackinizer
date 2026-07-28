@@ -1,22 +1,31 @@
 """Antigravity CLI adapter.
 
-Sessions live at
-``~/.gemini/tmp/<project-sha256>/chats/session-<timestamp>-<uuid>.json``.
-Unlike the others, the session is one JSON object that agy rewrites in
-place on every update, so there are no appended lines to follow.
+Antigravity 1.1.7 stores each conversation under::
 
-The runner hands the whole file body to ``parse`` on each change (the adapter
-declares ``whole_file = True``); this adapter parses it and normalizes the
-most recent message into a typed :data:`Message`.
+    ~/.gemini/antigravity-cli/brain/<conversation-uuid>/
+        .system_generated/logs/transcript_full.jsonl
 
-See ``docs/cli-scraping-investigation.md`` for the empirical layout.
+The sibling ``transcript.jsonl`` is a truncated rendering of the same records,
+so this adapter intentionally matches only ``transcript_full.jsonl``: matching
+both would emit every turn twice and would discard parts of long thinking/tool
+results. The conversation directory UUID is the same ID accepted by
+Antigravity's ``--conversation`` flag and remains stable when that conversation
+is resumed.
+
+Each appended JSON object carries a provider ``step_index``, ``source``,
+``type``, ``status``, and ``created_at``. Model planner records contain text,
+thinking, and optionally one tool call; the following tool record uses the
+next step index. We derive a stable call id from that provider step index so
+the normalized :class:`ToolCall` and :class:`ToolResult` remain linked.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import cast
+from uuid import UUID
 
 import json
 
@@ -24,67 +33,88 @@ from trackinizer.lib.custom_json import JSON, json_freeze
 from trackinizer.trax.run.adapters.base import Event
 from trackinizer.types.agent_session_events import (
     AssistantMessage,
+    Compaction,
     Message,
+    SystemMessage,
     ToolCall,
+    ToolResult,
     UnknownMessage,
     UserMessage,
 )
 
 
+_SYSTEM_TYPES = frozenset(
+    {"CONVERSATION_HISTORY", "EPHEMERAL_MESSAGE", "SYSTEM_MESSAGE"}
+)
+_TOOL_RESULT_TYPES = frozenset(
+    {"CODE_ACTION", "LIST_DIRECTORY", "RUN_COMMAND", "VIEW_FILE"}
+)
+_ERROR_STATUSES = frozenset({"CANCELLED", "ERROR", "FAILED"})
+_TERMINAL_STATUSES = _ERROR_STATUSES | {"DONE"}
+
+
 class AntigravityAdapter:
-    """Reads the ``agy`` CLI's whole-file session JSON.
-
-    Stateful within one run: agy rewrites its whole session JSON in place,
-    so the runner re-reads the entire body on each change. The adapter tracks
-    how many messages it has already emitted, per session file, and emits only
-    the newly-appended slice on the next parse, so a burst of N messages
-    between two polls surfaces all N rather than only the last (REV-004).
-
-    The cursor is keyed by the body's ``sessionId`` (every agy session file
-    stamps one), not a single counter: the runner reuses ONE adapter across
-    every matching session file, so a per-adapter counter would carry one
-    file's count into the next and drop the second file's turns (#498). Each
-    run builds a fresh adapter, so the cursors never leak across runs.
-    """
+    """Reads Antigravity's append-only full-conversation transcripts."""
 
     name: str = "agy"
     cli_binary: str = "agy"
-    whole_file: bool = True
-
-    def __init__(self) -> None:
-        # Per-session-file count of leading messages already emitted, keyed by
-        # the body's ``sessionId``. The next parse of that file emits
-        # ``messages[_emitted[session_id]:]`` and advances its entry.
-        self._emitted: dict[str, int] = {}
+    whole_file: bool = False
 
     @property
-    def _tmp_dir(self) -> Path:
-        # Resolve ``$HOME`` per call, not at import (see ClaudeAdapter).
-        return Path.home() / ".gemini" / "tmp"
+    def _brain_dir(self) -> Path:
+        # Resolve ``$HOME`` per call, like every filesystem adapter: tests and
+        # a run under a switched home must not inherit an import-time path.
+        return Path.home() / ".gemini" / "antigravity-cli" / "brain"
 
     def session_dirs(self) -> Iterable[Path]:
-        tmp = self._tmp_dir
-        if not tmp.is_dir():
-            return ()
-        return tuple(d / "chats" for d in tmp.iterdir() if (d / "chats").is_dir())
+        brain = self._brain_dir
+        return (brain,) if brain.is_dir() else ()
 
     def matches_session_file(self, path: Path) -> bool:
-        return (
-            path.suffix == ".json"
-            and path.parent.name == "chats"
-            and path.name.startswith("session-")
-        )
+        return self._conversation_id_from_path(path) is not None
 
     def session_id_from_path(self, path: Path) -> str | None:
-        # Antigravity's ``session-<id>.json`` stem carries an id, but resume
-        # correlation isn't wired for it yet; treat as non-resumable for now.
-        del path
-        return None
+        """Return the exact native Antigravity conversation UUID in ``path``."""
+        return self._conversation_id_from_path(path)
+
+    def _conversation_id_from_path(self, path: Path) -> str | None:
+        """Validate the full transcript path and extract its canonical UUID."""
+        try:
+            relative = path.relative_to(self._brain_dir)
+        except ValueError:
+            return None
+        if len(relative.parts) != 4 or relative.parts[1:] != (
+            ".system_generated",
+            "logs",
+            "transcript_full.jsonl",
+        ):
+            return None
+        # Do not let a provider-shaped symlink escape the transcript store.
+        # Exact binding later retains an opened descriptor; this lexical scan
+        # still rejects every currently symlinked component before opening.
+        provider_root = self._brain_dir.parent.parent
+        components = (provider_root, provider_root / "antigravity-cli", self._brain_dir)
+        current = self._brain_dir
+        relative_components: list[Path] = []
+        for part in relative.parts:
+            current /= part
+            relative_components.append(current)
+        if any(
+            component.is_symlink() for component in (*components, *relative_components)
+        ):
+            return None
+        candidate = relative.parts[0]
+        try:
+            parsed = UUID(candidate)
+        except ValueError:
+            return None
+        # Antigravity 1.1.7 writes canonical lowercase UUIDs. Reject alternate
+        # spellings so a path cannot acquire a different identity after
+        # normalization.
+        return candidate if str(parsed) == candidate else None
 
     def parse(self, raw: bytes, *, whole_file: bool) -> Iterable[Event]:
-        # The runner passes the whole file body here (whole_file=True); we emit
-        # the messages appended to this session file since the last parse.
-        del whole_file
+        del whole_file  # Antigravity's transcript is line-oriented; one record in.
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -92,90 +122,107 @@ class AntigravityAdapter:
         if not isinstance(parsed, Mapping):
             return ()
         obj = json_freeze(cast(Mapping[str, object], parsed))
-        messages = obj.get("messages")
-        if (
-            not isinstance(messages, Sequence)
-            or isinstance(messages, str)
-            or not messages
-        ):
-            # An empty file is session lifecycle, not a turn; lifecycle lives
-            # on the AgentSession row, so there is no event to emit here.
+        message = _to_message(obj)
+        if message is None:
             return ()
-        # Emit only messages appended to THIS session file since its last parse.
-        # The cursor is keyed by ``sessionId`` so one adapter draining several
-        # files keeps their counts apart (#498). A shorter list than already
-        # emitted means the file rotated or was rewritten from scratch; restart
-        # from its start so nothing is silently skipped (REV-004).
-        #
-        # A body with no ``sessionId`` (malformed / pre-id file) carries no
-        # stable per-file identity, so it cannot share the keyed cursor map: two
-        # keyless files would both key ``""`` and the second's turns would be
-        # dropped against the first's count (K6-002). Such a body emits every
-        # message it carries -- the runner only re-parses a whole-file on a
-        # ``(size, mtime)`` change, so a keyless file is re-emitted only when it
-        # actually changes, never per idle poll.
-        session_id = _str(obj.get("sessionId"))
-        if not session_id:
-            appended = messages
-        else:
-            emitted = self._emitted.get(session_id, 0)
-            if len(messages) < emitted:
-                emitted = 0
-            appended = messages[emitted:]
-            self._emitted[session_id] = len(messages)
-        events: list[Event] = []
-        for raw_msg in appended:
-            if not isinstance(raw_msg, Mapping):
-                continue
-            # Even after ``isinstance(_, Mapping)``, ty won't narrow the indexed
-            # element into ``JSON`` (generic invariance); cast as the project
-            # pattern does (see ``switchboard/hub.py:989``).
-            message = _to_message(cast(JSON, raw_msg))
-            if message is not None:
-                events.append(Event(message=message))
-        return tuple(events)
+        return (Event(message=message, timestamp=_timestamp(obj)),)
 
 
-def _to_message(msg: JSON) -> Message | None:
-    """Normalize one agy message to a typed message, or ``None`` to skip."""
-    msg_type = msg.get("type")
-    if msg_type == "user":
-        return UserMessage(text=_str(msg.get("content")))
-    if msg_type == "agy":
-        return _assistant_message(msg)
-    return UnknownMessage(raw=msg)
+def _to_message(obj: JSON) -> Message | None:
+    """Normalize one Antigravity record, or skip empty lifecycle markers."""
+    source = _str(obj.get("source"))
+    record_type = _str(obj.get("type"))
+
+    if source == "USER_EXPLICIT" and record_type == "USER_INPUT":
+        return UserMessage(text=_str(obj.get("content")))
+    if source == "MODEL" and record_type == "PLANNER_RESPONSE":
+        return _assistant_message(obj)
+    if source == "MODEL" and record_type in _TOOL_RESULT_TYPES:
+        return _tool_result(obj)
+    if source == "SYSTEM" and record_type == "CHECKPOINT":
+        return Compaction(text=_str(obj.get("content")))
+    if source == "SYSTEM" and record_type in _SYSTEM_TYPES:
+        content = _str(obj.get("content"))
+        # Antigravity writes an empty CONVERSATION_HISTORY marker when it
+        # initializes the context. It is lifecycle, not a message the model saw.
+        return SystemMessage(text=content) if content else None
+    return UnknownMessage(raw=obj)
 
 
-def _assistant_message(msg: JSON) -> Message:
-    """An ``agy`` message: response text plus any ``toolCalls`` entries."""
-    # Keyed by id (last-wins) so a duplicate ``toolCalls`` id cannot trip
-    # ``AssistantMessage``'s duplicate-id invariant, which would raise and let
-    # the runner silently drop the whole turn (mirrors claude's R-41 guard).
-    tool_calls: dict[str, ToolCall] = {}
-    for call in _tool_calls(msg):
-        tc = ToolCall(
-            id=_str(call.get("id")),
-            name=_str(call.get("name")),
-            args=_mapping(call.get("args")),
+def _assistant_message(obj: JSON) -> Message:
+    """One Antigravity model response, including nested tool invocations."""
+    raw_calls = _tool_calls(obj)
+    if len(raw_calls) > 1:
+        # Only zero/one-call planner records are evidenced in 1.1.7. Inventing
+        # future step ids for a batch could link unrelated tool results.
+        return UnknownMessage(raw=obj)
+    calls: tuple[ToolCall, ...] = ()
+    if raw_calls:
+        step_index = _step_index(obj)
+        if step_index is None:
+            return UnknownMessage(raw=obj)
+        result_step = step_index + 1
+        raw_call = raw_calls[0]
+        calls = (
+            ToolCall(
+                id=f"agy-step-{result_step}",
+                name=_str(raw_call.get("name")),
+                args=_mapping(raw_call.get("args")),
+            ),
         )
-        tool_calls[tc.id] = tc
     return AssistantMessage(
-        text=_str(msg.get("content")), tool_calls=tuple(tool_calls.values())
+        text=_str(obj.get("content")),
+        thinking=_str(obj.get("thinking")),
+        tool_calls=calls,
     )
 
 
-def _tool_calls(msg: JSON) -> tuple[JSON, ...]:
-    """The ``toolCalls`` array of an agy message, or empty."""
-    calls = msg.get("toolCalls")
+def _tool_calls(obj: JSON) -> tuple[JSON, ...]:
+    calls = obj.get("tool_calls")
     if not isinstance(calls, Sequence) or isinstance(calls, str):
         return ()
     return tuple(
-        cast(JSON, c) for c in cast("Sequence[object]", calls) if isinstance(c, Mapping)
+        cast(JSON, call)
+        for call in cast("Sequence[object]", calls)
+        if isinstance(call, Mapping)
     )
+
+
+def _tool_result(obj: JSON) -> Message:
+    step_index = _step_index(obj)
+    status = _str(obj.get("status"))
+    if step_index is None:
+        return UnknownMessage(raw=obj)
+    if status not in _TERMINAL_STATUSES:
+        return UnknownMessage(raw=obj)
+    return ToolResult(
+        call_id=f"agy-step-{step_index}",
+        content=_str(obj.get("content")),
+        is_error=status in _ERROR_STATUSES,
+    )
+
+
+def _timestamp(obj: JSON) -> datetime | None:
+    raw = obj.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def _str(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _step_index(obj: JSON) -> int | None:
+    value = obj.get("step_index")
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None
+    )
 
 
 def _mapping(value: object) -> dict[str, object]:

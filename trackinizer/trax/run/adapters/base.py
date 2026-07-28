@@ -59,11 +59,10 @@ class Adapter(Protocol):
     whole_file: bool
     """How the runner drains this adapter's session files.
 
-    ``False`` (claude / codex): the log is append-only JSONL; the runner
-    follows a byte offset and hands each new newline-terminated line to
-    :meth:`parse`. ``True`` (Antigravity): the CLI rewrites one JSON object in
-    place, so the runner re-reads the whole file on each change and hands
-    the entire body to :meth:`parse`.
+    ``False``: the log is append-only JSONL; the runner follows a byte offset
+    and hands each new newline-terminated line to :meth:`parse`. ``True``:
+    the CLI rewrites one JSON object in place, so the runner re-reads the
+    whole file on each change and hands the entire body to :meth:`parse`.
     """
 
     def session_dirs(self) -> Iterable[Path]:
