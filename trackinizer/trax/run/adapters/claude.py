@@ -72,9 +72,11 @@ class ClaudeAdapter:
         projects = self._projects_dir
         if not projects.is_dir():
             return ()
-        # Claude shards sessions per project (hashed cwd); return every
-        # project dir and let the runner find the ``*.jsonl`` files.
-        return tuple(d for d in projects.iterdir() if d.is_dir())
+        # Return the stable parent rather than only project directories that
+        # exist at snapshot time. Claude creates the cwd-derived project
+        # directory after launch on a first run; an exact SessionStart path
+        # must still validate as in-root before that child directory exists.
+        return (projects,)
 
     def matches_session_file(self, path: Path) -> bool:
         return path.suffix == ".jsonl" and path.parent.parent == self._projects_dir

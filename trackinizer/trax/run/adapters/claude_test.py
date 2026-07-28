@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import json
 
@@ -15,6 +15,10 @@ from trackinizer.types.agent_session_events import (
     UnknownMessage,
     UserMessage,
 )
+
+
+if TYPE_CHECKING:
+    import pytest
 
 
 # The claude adapter is line-stateless, so one instance serves every case.
@@ -200,6 +204,20 @@ class TestClaudeParseLine:
 
 class TestClaudeSessionId:
     """Claude's own session id is the ``<session-id>.jsonl`` filename stem."""
+
+    def test_root_covers_a_project_directory_created_after_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        projects = tmp_path / ".claude" / "projects"
+        projects.mkdir(parents=True)
+        local_adapter = ClaudeAdapter()
+
+        assert tuple(local_adapter.session_dirs()) == (projects,)
+        future = projects / "future-project" / "session-id.jsonl"
+        assert future.resolve().is_relative_to(
+            next(iter(local_adapter.session_dirs())).resolve()
+        )
 
     def test_session_id_from_path_is_filename_stem(self) -> None:
         path = Path.home() / ".claude" / "projects" / "hash" / "abc-123-def.jsonl"
