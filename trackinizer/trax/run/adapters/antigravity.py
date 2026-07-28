@@ -60,14 +60,25 @@ class AntigravityAdapter:
     cli_binary: str = "agy"
 
     @property
-    def _brain_dir(self) -> Path:
+    def brain_dir(self) -> Path:
+        """Antigravity's conversation root under its retained state directory."""
         # Resolve ``$HOME`` per call, like every filesystem adapter: tests and
         # a run under a switched home must not inherit an import-time path.
         return Path.home() / ".gemini" / "antigravity-cli" / "brain"
 
     def session_dirs(self) -> Iterable[Path]:
-        brain = self._brain_dir
+        brain = self.brain_dir
         return (brain,) if brain.is_dir() else ()
+
+    def transcript_path(self, cli_session_id: str) -> Path:
+        """The canonical full-conversation transcript for one native UUID."""
+        return (
+            self.brain_dir
+            / cli_session_id
+            / ".system_generated"
+            / "logs"
+            / "transcript_full.jsonl"
+        )
 
     def matches_session_file(self, path: Path) -> bool:
         return self._conversation_id_from_path(path) is not None
@@ -86,7 +97,7 @@ class AntigravityAdapter:
     def _conversation_id_from_path(self, path: Path) -> str | None:
         """Validate the full transcript path and extract its canonical UUID."""
         try:
-            relative = path.relative_to(self._brain_dir)
+            relative = path.relative_to(self.brain_dir)
         except ValueError:
             return None
         if len(relative.parts) != 4 or relative.parts[1:] != (
@@ -98,9 +109,9 @@ class AntigravityAdapter:
         # Do not let a provider-shaped symlink escape the transcript store.
         # Exact binding later retains an opened descriptor; this lexical scan
         # still rejects every currently symlinked component before opening.
-        provider_root = self._brain_dir.parent.parent
-        components = (provider_root, provider_root / "antigravity-cli", self._brain_dir)
-        current = self._brain_dir
+        provider_root = self.brain_dir.parent.parent
+        components = (provider_root, provider_root / "antigravity-cli", self.brain_dir)
+        current = self.brain_dir
         relative_components: list[Path] = []
         for part in relative.parts:
             current /= part
