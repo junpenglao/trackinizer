@@ -161,20 +161,22 @@ repos:
         always_run: true
         pass_filenames: false
         stages: [pre-push]
+        # --testmon-forceselect runs only tests whose covered code changed since
+        # the cached .testmondata baseline. It must be -forceselect, NOT plain
+        # --testmon: pyproject addopts carries a default `-m` marker filter, and
+        # plain --testmon self-deactivates whenever -m is present
+        # (tarpas/pytest-testmon#238). On a cache miss testmon runs everything,
+        # so it is fail-safe.
         entry: &pytest-entry >-
           bash -c '
-            if [ -n "$CI" ]; then
-              workers=1;
-            else
-              workers=$(nproc);
-              workers=$((workers / 2));
-              ((workers < 2)) && workers=2;
-              ((workers > 32)) && workers=32;
-            fi;
+            workers=$(nproc);
+            workers=$((workers / 2));
+            ((workers < 2)) && workers=2;
+            ((workers > 32)) && workers=32;
             exec uv --quiet run --frozen --group test \
             pytest -n="$workers" "$@"
           ' pytest
-        args: [-q, --tb=short]
+        args: [-q, --tb=short, --testmon-forceselect]
 
       - id: pytest-integration
         name: pytest (integration)
@@ -187,14 +189,10 @@ repos:
         # stays strict so an empty collection there still fails.
         entry: >-
           bash -c '
-            if [ -n "$CI" ]; then
-              workers=1;
-            else
-              workers=$(nproc);
-              workers=$((workers / 2));
-              ((workers < 2)) && workers=2;
-              ((workers > 32)) && workers=32;
-            fi;
+            workers=$(nproc);
+            workers=$((workers / 2));
+            ((workers < 2)) && workers=2;
+            ((workers > 32)) && workers=32;
             uv --quiet run --frozen --group test \
             pytest -n="$workers" "$@" || test "$?" = 5
           ' pytest
