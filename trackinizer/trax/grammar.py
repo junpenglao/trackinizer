@@ -465,6 +465,15 @@ class Field:
     list_add: str = ""
     list_remove: str = ""
     ref_kind: Inquiry.InquiryKind | None = None
+    json_coerce: bool = False
+    """When True, a string value is parsed as JSON after stdin/file resolution.
+
+    Used for JSONB columns (``Experiment.config``) where the wire type is
+    ``dict[str, object]`` but the CLI accepts the JSON text as a single
+    token or reads it from stdin / a file via ``-`` / ``@path``. The
+    coercion is deferred to :func:`~verbs.run_set_field` so ``@path`` and
+    ``-`` resolve first, before the text is deserialized.
+    """
 
     def coerce(self, value: str) -> object:
         """Coerce a string token to its wire value."""
@@ -580,6 +589,13 @@ _FIELDS: tuple[Field, ...] = (
         payload_key="outcome",
         shape="scalar",
         help="result of the experiment",
+    ),
+    Field(
+        cli_name="config",
+        payload_key="config",
+        shape="scalar",
+        help="run config (JSON object; use @path or - for large payloads)",
+        json_coerce=True,
     ),
     Field(
         cli_name="source",

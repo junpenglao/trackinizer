@@ -858,6 +858,12 @@ def _parse_list_action(
         return RemoveList(field=field, value=ref_text(ref), ref=ref), consumed + 2
     value = required_token(tokens, index + 2, f"expected value for {field}")
     if op_lower == "to":
+        # Label fields split comma-separated values so ``label to "a,b"``
+        # stores two labels, not one literal string with a comma (Issue#977).
+        # Mirrors the edge-metadata path that already resolves CSV labels.
+        if field in ("label", "labels"):
+            split = tuple(resolve_labels((value,)))
+            return SetField(field=list_payload_field(field), value=split), 3
         return SetField(field=list_payload_field(field), value=(value,)), 3
     if op_lower == "add":
         return AddList(field=field, value=value), 3

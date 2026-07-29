@@ -175,16 +175,38 @@ async def web_recent_changes(
     request: Request,
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     limit: int = 50,
+    actor: str | None = None,
+    exclude_actor: str | None = None,
 ) -> list[WebView]:
-    """Most-recent ``change_log`` rows, snapshot deltas flattened."""
+    """Most-recent ``change_log`` rows, snapshot deltas flattened.
+
+    Query params:
+      limit          Maximum rows to return (1–1000, default 50).
+      actor          Include only changes by this actor.
+      exclude_actor  Exclude changes by this actor (e.g. a bulk-rewrite agent).
+    """
     del identity
     if limit < 1 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit must be in [1, 1000]")
+    # Build server-side filters so a bulk-rewrite actor can be excluded from
+    # the narrative view without post-hoc client-side filtering.
+    where_clauses: list[str] = []
+    query_params: list[object] = []
+    if actor is not None:
+        query_params.append(actor)
+        where_clauses.append(f"c.actor = ${len(query_params)}")
+    if exclude_actor is not None:
+        query_params.append(exclude_actor)
+        where_clauses.append(f"c.actor != ${len(query_params)}")
+    where = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    query_params.append(limit)
+    query = (
+        _CHANGE_SELECT
+        + where
+        + f" ORDER BY c.created DESC, c.id DESC LIMIT ${len(query_params)}"
+    )
     async with get_store(request).engine.acquire() as conn:
-        rows = await conn.fetch(
-            _CHANGE_SELECT + " ORDER BY c.created DESC, c.id DESC LIMIT $1",
-            limit,
-        )
+        rows = await conn.fetch(query, *query_params)
     return [_change_to_dict(r) for r in rows]
 
 

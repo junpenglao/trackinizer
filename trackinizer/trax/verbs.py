@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import ClassVar, Final, cast, get_args, override
 
 import argparse
+import json as _json
 import math
 import os
 import sys
@@ -1215,6 +1216,14 @@ class Kind(Command):
             method(target_id, value_id, actor=actor)
             echo(f"{verb_past}: {ref} {spec.cli_name} {action.ref}")
             return
+        # Label add/del splits comma-separated values so ``label add "a,b"``
+        # adds two labels, not one literal "a,b" (Issue#977 -- mirrors the
+        # edge-metadata path and the list-``to`` fix in the parser).
+        if spec.payload_key == "labels" and "," in action.value:
+            for part in fmt.resolve_labels((action.value,)):
+                method(target_id, part, actor=actor)
+                echo(f"{verb_past}: {ref} {spec.cli_name} {part}")
+            return
         method(target_id, action.value, actor=actor)
         echo(f"{verb_past}: {ref} {spec.cli_name} {action.value}")
 
@@ -1835,6 +1844,20 @@ def run_set_field(
     client = client_factory()
     _, target_id = client.resolve_id(ref)
     value = _resolve_set_value(action, client)
+    # ``json_coerce`` fields (JSONB columns, e.g. ``config``) arrive as a
+    # raw string after stdin/file resolution; parse to a dict here so the
+    # wire body carries the structured object, not a JSON-encoded string.
+    spec = FIELDS_BY_NAME.get(action.field)
+    if spec is not None and spec.json_coerce and isinstance(value, str):
+        try:
+            parsed = _json.loads(value)
+        except _json.JSONDecodeError as err:
+            raise ClientError(f"field {action.field!r}: invalid JSON -- {err}") from err
+        if not isinstance(parsed, dict):
+            raise ClientError(
+                f"field {action.field!r}: expected a JSON object, got {type(parsed).__name__}"
+            )
+        value = parsed
     client.edit(
         target_id,
         action.field,
@@ -1928,11 +1951,18 @@ class Recent(Command):
         options=(
             ("--limit INT", "Maximum changes to return."),
             ("--format TEXT", "text|json."),
+            ("--actor ACTOR", "Show only changes by this actor."),
+            (
+                "--exclude-actor ACTOR",
+                "Exclude changes by this actor (e.g. a bulk-rewrite agent).",
+            ),
         ),
         examples=(
             "trax recent",
             "trax recent --limit 10",
             "trax recent --format json",
+            "trax recent --actor alice",
+            "trax recent --exclude-actor bulk-rewrite-agent",
         ),
     )
 
@@ -1947,6 +1977,17 @@ class Recent(Command):
             default="text",
             choices=("text", "json"),
         )
+        parser.add_argument(
+            "--actor",
+            default=None,
+            help="show only changes by this actor",
+        )
+        parser.add_argument(
+            "--exclude-actor",
+            dest="exclude_actor",
+            default=None,
+            help="exclude changes by this actor (e.g. during a bulk rewrite)",
+        )
         return parser
 
     @classmethod
@@ -1958,7 +1999,11 @@ class Recent(Command):
         client_factory: Callable[[], Client],
     ) -> None:
         del verb
-        rows = client_factory().recent_changes(limit=args.limit)
+        rows = client_factory().recent_changes(
+            limit=args.limit,
+            actor=args.actor,
+            exclude_actor=args.exclude_actor,
+        )
         if args.format_ == "json":
             echo(fmt.format_json(list(rows)), nl=False)
         else:

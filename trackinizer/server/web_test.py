@@ -1110,6 +1110,100 @@ class TestPhase4Pages:
         assert r.text == "CONSOLE-PAGE"
 
 
+# ---------------------------------------------------------------------------
+# Gap 4 — server-side actor/exclude-actor filters on recent_changes
+# ---------------------------------------------------------------------------
+
+
+class TestRecentChangesActorFilter:
+    """``GET /api/web/recent_changes?actor=X`` and ``?exclude_actor=X`` tests."""
+
+    @pytest.mark.asyncio
+    async def test_actor_filter_adds_where_clause(self) -> None:
+        """actor= param injects ``WHERE c.actor = $1`` before the ORDER BY."""
+        engine = FakeEngine()
+        store = _Store(engine=engine)
+        request = _request(store, engine)
+        engine.conn.fetch = AsyncMock(return_value=[_change_row(actor="alice")])
+
+        await web.web_recent_changes(
+            cast(Any, request), identity=_TEST_IDENTITY, limit=10, actor="alice"
+        )
+
+        query: str = engine.conn.fetch.call_args.args[0]
+        params: tuple[object, ...] = engine.conn.fetch.call_args.args[1:]
+        assert "WHERE" in query, "expected a WHERE clause for actor filter"
+        assert "c.actor = $1" in query
+        # First positional param is the actor value; last is the limit.
+        assert params[0] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_exclude_actor_filter_adds_ne_clause(self) -> None:
+        """exclude_actor= param injects ``WHERE c.actor != $1`` before ORDER BY."""
+        engine = FakeEngine()
+        store = _Store(engine=engine)
+        request = _request(store, engine)
+        engine.conn.fetch = AsyncMock(return_value=[_change_row(actor="human")])
+
+        await web.web_recent_changes(
+            cast(Any, request),
+            identity=_TEST_IDENTITY,
+            limit=10,
+            exclude_actor="bulk-agent",
+        )
+
+        query: str = engine.conn.fetch.call_args.args[0]
+        params: tuple[object, ...] = engine.conn.fetch.call_args.args[1:]
+        assert "WHERE" in query
+        assert "c.actor != $1" in query
+        assert params[0] == "bulk-agent"
+
+    @pytest.mark.asyncio
+    async def test_both_filters_combine_with_and(self) -> None:
+        """actor= AND exclude_actor= combine with AND in the WHERE clause."""
+        engine = FakeEngine()
+        store = _Store(engine=engine)
+        request = _request(store, engine)
+        engine.conn.fetch = AsyncMock(return_value=[])
+
+        await web.web_recent_changes(
+            cast(Any, request),
+            identity=_TEST_IDENTITY,
+            limit=10,
+            actor="alice",
+            exclude_actor="alice-bot",
+        )
+
+        query: str = engine.conn.fetch.call_args.args[0]
+        params: tuple[object, ...] = engine.conn.fetch.call_args.args[1:]
+        assert "WHERE" in query
+        assert "c.actor = $1" in query
+        assert "c.actor != $2" in query
+        assert " AND " in query
+        assert params[0] == "alice"
+        assert params[1] == "alice-bot"
+
+    def test_actor_filter_via_http_client(self) -> None:
+        """TestClient round-trip: ?actor=alice reaches the handler with the filter."""
+        engine = FakeEngine()
+        store = _Store(engine=engine)
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.store = store
+        web.attach(app)
+
+        async def _identity() -> AuthIdentity:
+            return _TEST_IDENTITY
+
+        app.dependency_overrides[current_user] = _identity
+        engine.conn.fetch = AsyncMock(return_value=[_change_row(actor="alice")])
+        c = TestClient(app)
+        r = c.get("/api/web/recent_changes", params={"actor": "alice", "limit": 5})
+        assert r.status_code == 200, r.text
+        query: str = engine.conn.fetch.call_args.args[0]
+        assert "c.actor = $" in query
+
+
 if __name__ == "__main__":  # pragma: no cover -- entry point only.
     from trackinizer.lib.testing.main import test_main
 

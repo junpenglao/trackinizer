@@ -69,6 +69,7 @@ PUT /api/inquiries/<uuid>/subscribers
 PUT /api/issue/<uuid>/issue_kind
 PUT /api/issue/<uuid>/validation
 PUT /api/issue/<uuid>/priority
+PUT /api/experiment/<uuid>/config
 PUT /api/experiment/<uuid>/outcome
 PUT /api/experiment/<uuid>/codechanges
 PUT /api/paper/<uuid>/source
@@ -107,6 +108,7 @@ DELETE /api/inquiries/<uuid>/subscribers
 DELETE /api/issue/<uuid>/issue_kind
 DELETE /api/issue/<uuid>/validation
 DELETE /api/issue/<uuid>/priority
+DELETE /api/experiment/<uuid>/config
 DELETE /api/experiment/<uuid>/outcome
 DELETE /api/experiment/<uuid>/codechanges
 DELETE /api/paper/<uuid>/source
@@ -233,6 +235,8 @@ GET /api/web/search?q=<query>&kind=<kind>
 GET /api/web/search?q=<query>&kind=<kind>&limit=N
 GET /api/web/recent_changes
 GET /api/web/recent_changes?limit=N
+GET /api/web/recent_changes?actor=<actor>
+GET /api/web/recent_changes?exclude_actor=<actor>
 GET /api/web/lookup/<uuid>
 GET /api/web/get/<uuid>
 GET /api/web/subscribe

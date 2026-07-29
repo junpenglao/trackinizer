@@ -448,7 +448,7 @@ verb_name   ::= "help" | "profile" | "next" | "search" | "recent"
   active Issue.
 - `trax search QUERY... [--kind KIND] [--limit INT] [--format
   table|json|ids]` -- cross-kind title/description search.
-- `trax recent [--limit INT] [--format text|json]` -- audit-log feed.
+- `trax recent [--limit INT] [--format text|json] [--actor ACTOR] [--exclude-actor ACTOR]` -- audit-log feed. `--actor` includes only changes by that actor; `--exclude-actor` suppresses them (e.g. to hide a bulk-rewrite pass).
 - `trax cost KIND SEQ [--deep] [--format text|json]` -- cost rollup.
 - `trax blocked` -- active Issues with at least one active blocker.
 - `trax board [--width INT]` -- Issues grouped by status.
@@ -504,7 +504,7 @@ the same commit.
 ### Editable scalar fields (`EDITABLE_FIELDS`)
 
 `owner`, `account`, `title`, `description`, `status`, `validation`,
-`priority`, `judgement`, `confidence`, `outcome`, `source`,
+`priority`, `judgement`, `confidence`, `outcome`, `config`, `source`,
 `google_scholar_cluster_id`, `google_scholar_cites_id`,
 `abstract`, `publication_type`, `venue`, `subvenue`, `publish_date`, `query`,
 `provider`, `sha`, `url`,

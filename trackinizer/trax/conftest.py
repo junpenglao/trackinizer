@@ -489,9 +489,26 @@ class FakeClient:
         self.calls.append(("search", (query,), {"kind": kind, "limit": limit}))
         return list(self.rows)
 
-    def recent_changes(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        self.calls.append(("recent_changes", (), {"limit": limit}))
-        return list(self.changes)
+    def recent_changes(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        exclude_actor: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            (
+                "recent_changes",
+                (),
+                {"limit": limit, "actor": actor, "exclude_actor": exclude_actor},
+            )
+        )
+        rows = list(self.changes)
+        if actor is not None:
+            rows = [r for r in rows if r.get("actor") == actor]
+        if exclude_actor is not None:
+            rows = [r for r in rows if r.get("actor") != exclude_actor]
+        return rows[:limit]
 
     def cost_for(self, target_id: uuid.UUID, *, deep: bool = False) -> dict[str, float]:
         self.calls.append(("cost_for", (target_id,), {"deep": deep}))

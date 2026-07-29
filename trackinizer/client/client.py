@@ -497,9 +497,20 @@ class Client:
             "/api/web/search",
         )
 
-    def recent_changes(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def recent_changes(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        exclude_actor: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, object] = {"limit": limit}
+        if actor is not None:
+            params["actor"] = actor
+        if exclude_actor is not None:
+            params["exclude_actor"] = exclude_actor
         return _require_list(
-            self.get("/api/web/recent_changes", params={"limit": limit}),
+            self.get("/api/web/recent_changes", params=params),
             "/api/web/recent_changes",
         )
 

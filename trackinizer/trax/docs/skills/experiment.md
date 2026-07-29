@@ -26,6 +26,28 @@ Per-kind expectations doc (SoT). Fields owned by `types/inquiries.py`; grammar b
 - Lifecycle on `status`: `active` while running, `complete` when done, `invalid`
   if retracted.
 
+## Setting codechanges (which code state the experiment ran at)
+
+Use the `codechange` list field to record the commit(s) the experiment ran at.
+This is distinct from the `produced` edge (which records production lineage --
+"an Issue produced this Experiment"):
+
+```bash
+# Link an existing CodeChange row by seq:
+trax experiment 7 codechange add 42 --as Agent
+
+# Multiple commits (compare two states):
+trax experiment 7 codechange add 42 codechange add 43 --as Agent
+```
+
+Verify with `trax experiment 7 codechange` (projects the current list).
+
+`trax experiment 7 codechange to 42` replaces the whole list with one entry.
+
+Do NOT use `produced codechange` to record which code state an experiment ran
+at -- that creates a production edge (Experiment → CodeChange), which means
+"this experiment produced a commit", not "this experiment ran at this commit".
+
 ## Provenance and citation
 
 - An Experiment is produced by the Issue/Belief whose inquiry spawned it

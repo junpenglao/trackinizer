@@ -3082,6 +3082,149 @@ def test_issue_metric_is_unknown_token(client: FakeClient) -> None:
         run(["issue", "2", "metric", "at", "loss"], client)
 
 
+# ---------------------------------------------------------------------------
+# Gap 1 — Experiment.config writeable via CLI (json_coerce)
+# ---------------------------------------------------------------------------
+
+
+def test_config_to_inline_json_coerces_to_dict(client: FakeClient) -> None:
+    """``config to '{"lr": 0.001}'`` sends a dict, not the raw JSON string."""
+    run(["experiment", "1", "config", "to", '{"lr": 0.001}', "--as=alice"], client)
+    edit_calls = [c for c in client.calls if c[0] == "edit"]
+    assert len(edit_calls) == 1, "expected one edit call"
+    _target_id, field, value = edit_calls[0][1]
+    assert field == "config"
+    assert isinstance(value, dict), f"expected dict, got {type(value)}"
+    assert value == {"lr": 0.001}
+
+
+def test_config_to_json_from_file(
+    client: FakeClient,
+    tmp_path: Path,
+) -> None:
+    """``config to @path`` reads the file and JSON-coerces to a dict."""
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text('{"epochs": 10, "lr": 0.01}', encoding="utf-8")
+    run(["experiment", "1", "config", "to", f"@{cfg_file}", "--as=alice"], client)
+    edit_calls = [c for c in client.calls if c[0] == "edit"]
+    assert len(edit_calls) == 1
+    _target_id, field, value = edit_calls[0][1]
+    assert field == "config"
+    assert value == {"epochs": 10, "lr": 0.01}
+
+
+def test_config_to_json_from_stdin(
+    client: FakeClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``config to -`` reads stdin and JSON-coerces to a dict."""
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"batch_size": 32}'))
+    run(["experiment", "1", "config", "to", "-", "--as=alice"], client)
+    edit_calls = [c for c in client.calls if c[0] == "edit"]
+    assert len(edit_calls) == 1
+    _target_id, field, value = edit_calls[0][1]
+    assert field == "config"
+    assert value == {"batch_size": 32}
+
+
+def test_config_invalid_json_raises_client_error(client: FakeClient) -> None:
+    """A syntactically invalid JSON payload raises ``ClientError``."""
+    with pytest.raises(ClientError, match="invalid JSON"):
+        run(["experiment", "1", "config", "to", "{not valid}", "--as=alice"], client)
+
+
+def test_config_non_object_json_raises_client_error(client: FakeClient) -> None:
+    """Valid JSON that is not an object (e.g. a list) raises ``ClientError``."""
+    with pytest.raises(ClientError, match="expected a JSON object"):
+        run(["experiment", "1", "config", "to", "[1, 2, 3]", "--as=alice"], client)
+
+
+# ---------------------------------------------------------------------------
+# Gap 3 — Multi-label regression (Issue#977)
+# ---------------------------------------------------------------------------
+
+
+def test_label_to_comma_string_splits_to_two_labels(client: FakeClient) -> None:
+    """``label to "a,b"`` must store two distinct labels, not one literal string.
+
+    Regression for Issue#977 where the ``to`` op wrapped the raw comma-joined
+    string as a single-element tuple, producing label ``'a,b'`` instead of
+    labels ``['a', 'b']``.
+    """
+    run(["issue", "7", "label", "to", "a,b", "--as=alice"], client)
+    edit_calls = [c for c in client.calls if c[0] == "edit"]
+    assert len(edit_calls) == 1
+    _target_id, field, value = edit_calls[0][1]
+    assert field == "labels"
+    # Must be two distinct labels, not one literal "a,b".
+    assert isinstance(value, tuple)
+    assert len(value) == 2, f"expected 2 labels, got {len(value)}: {value!r}"
+    assert "a" in value
+    assert "b" in value
+    assert "a,b" not in value
+
+
+def test_label_add_comma_string_splits_to_two_add_calls(client: FakeClient) -> None:
+    """``label add "a,b"`` must emit two separate ``add_label`` calls.
+
+    Regression for Issue#977: a comma-joined string was passed as one opaque
+    add, producing a literal ``'a,b'`` label instead of two distinct ones.
+    """
+    run(["issue", "7", "label", "add", "a,b", "--as=alice"], client)
+    add_calls = [c for c in client.calls if c[0] == "add_label"]
+    added = [c[1][1] for c in add_calls]
+    assert len(add_calls) == 2, f"expected 2 add_label calls, got {add_calls}"
+    assert "a" in added
+    assert "b" in added
+    assert "a,b" not in added
+
+
+# ---------------------------------------------------------------------------
+# Gap 4 — ``trax recent`` actor/exclude-actor filters
+# ---------------------------------------------------------------------------
+
+
+def test_recent_actor_filter_passed_to_client(client: FakeClient) -> None:
+    """``--actor alice`` forwards actor='alice' to ``recent_changes()``."""
+    run(["recent", "--actor", "alice"], client)
+    rc_calls = [c for c in client.calls if c[0] == "recent_changes"]
+    assert rc_calls, "expected recent_changes to be called"
+    assert rc_calls[0][2]["actor"] == "alice"
+    assert rc_calls[0][2]["exclude_actor"] is None
+
+
+def test_recent_exclude_actor_filter_passed_to_client(client: FakeClient) -> None:
+    """``--exclude-actor bulk`` forwards exclude_actor='bulk' to ``recent_changes()``."""
+    run(["recent", "--exclude-actor", "bulk"], client)
+    rc_calls = [c for c in client.calls if c[0] == "recent_changes"]
+    assert rc_calls, "expected recent_changes to be called"
+    assert rc_calls[0][2]["exclude_actor"] == "bulk"
+    assert rc_calls[0][2]["actor"] is None
+
+
+def test_recent_actor_filter_rows_in_fake_client(client: FakeClient) -> None:
+    """FakeClient applies actor filter so the verb returns only matching rows."""
+    client.changes = [
+        {"actor": "alice", "kind": "created", "subject_kind": "Issue"},
+        {"actor": "bot", "kind": "edited", "subject_kind": "Belief"},
+    ]
+    # Only the alice row survives the filter.
+    rows = client.recent_changes(actor="alice")
+    assert all(r["actor"] == "alice" for r in rows)
+    assert len(rows) == 1
+
+
+def test_recent_exclude_actor_filter_rows_in_fake_client(client: FakeClient) -> None:
+    """FakeClient applies exclude_actor filter so the verb omits the excluded actor."""
+    client.changes = [
+        {"actor": "alice", "kind": "created", "subject_kind": "Issue"},
+        {"actor": "bot", "kind": "edited", "subject_kind": "Belief"},
+    ]
+    rows = client.recent_changes(exclude_actor="bot")
+    assert all(r.get("actor") != "bot" for r in rows)
+    assert len(rows) == 1
+
+
 if __name__ == "__main__":
     from trackinizer.lib.testing.main import test_main
 
