@@ -1139,7 +1139,7 @@ class TestRecentChangesActorFilter:
 
     @pytest.mark.asyncio
     async def test_exclude_actor_filter_adds_ne_clause(self) -> None:
-        """exclude_actor= param injects ``WHERE c.actor != $1`` before ORDER BY."""
+        """exclude_actor= param injects ``WHERE c.actor IS DISTINCT FROM $1``."""
         engine = FakeEngine()
         store = _Store(engine=engine)
         request = _request(store, engine)
@@ -1155,7 +1155,7 @@ class TestRecentChangesActorFilter:
         query: str = engine.conn.fetch.call_args.args[0]
         params: tuple[object, ...] = engine.conn.fetch.call_args.args[1:]
         assert "WHERE" in query
-        assert "c.actor != $1" in query
+        assert "c.actor IS DISTINCT FROM $1" in query
         assert params[0] == "bulk-agent"
 
     @pytest.mark.asyncio
@@ -1178,7 +1178,7 @@ class TestRecentChangesActorFilter:
         params: tuple[object, ...] = engine.conn.fetch.call_args.args[1:]
         assert "WHERE" in query
         assert "c.actor = $1" in query
-        assert "c.actor != $2" in query
+        assert "c.actor IS DISTINCT FROM $2" in query
         assert " AND " in query
         assert params[0] == "alice"
         assert params[1] == "alice-bot"

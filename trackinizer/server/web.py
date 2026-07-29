@@ -197,13 +197,13 @@ async def web_recent_changes(
         where_clauses.append(f"c.actor = ${len(query_params)}")
     if exclude_actor is not None:
         query_params.append(exclude_actor)
-        where_clauses.append(f"c.actor != ${len(query_params)}")
+        where_clauses.append(f"c.actor IS DISTINCT FROM ${len(query_params)}")
     where = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     query_params.append(limit)
-    query = (
-        _CHANGE_SELECT
-        + where
-        + f" ORDER BY c.created DESC, c.id DESC LIMIT ${len(query_params)}"
+    query = vetted_sql(
+        _CHANGE_SELECT,
+        where,
+        f" ORDER BY c.created DESC, c.id DESC LIMIT ${len(query_params)}",
     )
     async with get_store(request).engine.acquire() as conn:
         rows = await conn.fetch(query, *query_params)
