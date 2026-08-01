@@ -223,6 +223,32 @@ def test_graph_live_adds_are_seeded_before_reheat() -> None:
     assert "function relaxNewEdges()" not in html
 
 
+def test_spa_exact_sequence_jump_uses_selected_kind() -> None:
+    """The header can resolve one exact ``Kind#seq`` without a title search."""
+    html = _INDEX_HTML.read_text()
+    controls = [
+        'id="kind-picker"',
+        'id="exact-seq"',
+        'id="exact-go"',
+        'id="search-box"',
+    ]
+    positions = [html.index(control) for control in controls]
+    assert positions == sorted(positions), (
+        "exact sequence controls must sit between the kind picker and search"
+    )
+    jump = html[
+        html.index("function buildExactJump()") : html.index(
+            "function buildSearch()",
+        )
+    ]
+    assert 'document.getElementById("kind-picker")' in jump
+    assert "Number.isSafeInteger(seq)" in jump
+    assert "`#/ref/${encodeURIComponent(kind)}/${seq}`" in jump
+    assert 'go.addEventListener("click", jump)' in jump
+    assert 'if (e.key === "Enter") jump();' in jump
+    assert "buildExactJump();" in html
+
+
 if __name__ == "__main__":  # pragma: no cover -- entry point only.
     from trackinizer.lib.testing.main import test_main
 

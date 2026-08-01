@@ -52,10 +52,11 @@
   header nav {
     display: flex; align-items: center; gap: 6px; flex: 1; flex-wrap: wrap;
   }
-  header select, header input[type="search"], header button {
+  header select, header input[type="search"], header input[type="number"], header button {
     font: inherit; padding: 4px 8px; border: 1px solid var(--line);
     background: var(--bg); color: var(--fg); border-radius: 3px;
   }
+  header input[type="number"] { width: 108px; }
   header input[type="search"] { min-width: 240px; flex: 1; max-width: 600px; }
   header button { cursor: pointer; }
   header button:hover { border-color: var(--accent); }
@@ -285,6 +286,9 @@
     <select id="kind-picker">
       <option value="">List kind...</option>
     </select>
+    <input type="number" id="exact-seq" min="1" step="1"
+           placeholder="exact number" aria-label="Exact sequence number">
+    <button id="exact-go" type="button">go</button>
     <select id="new-picker">
       <option value="">New...</option>
     </select>
@@ -1954,11 +1958,37 @@ function buildPickers() {
   }
   kindPicker.addEventListener("change", e => {
     if (e.target.value) location.hash = `#/list/${e.target.value}`;
-    e.target.selectedIndex = 0;
   });
   newPicker.addEventListener("change", e => {
     if (e.target.value) location.hash = `#/new/${e.target.value}`;
     e.target.selectedIndex = 0;
+  });
+}
+
+function buildExactJump() {
+  const kindPicker = document.getElementById("kind-picker");
+  const seqInput = document.getElementById("exact-seq");
+  const go = document.getElementById("exact-go");
+
+  const jump = () => {
+    const kind = kindPicker.value;
+    const seq = Number(seqInput.value);
+    if (!kind) {
+      toast("select a kind first", true);
+      kindPicker.focus();
+      return;
+    }
+    if (!Number.isSafeInteger(seq) || seq < 1) {
+      toast("enter an exact positive number", true);
+      seqInput.focus();
+      return;
+    }
+    location.hash = `#/ref/${encodeURIComponent(kind)}/${seq}`;
+  };
+
+  go.addEventListener("click", jump);
+  seqInput.addEventListener("keydown", e => {
+    if (e.key === "Enter") jump();
   });
 }
 
@@ -2026,6 +2056,7 @@ document.getElementById("user-nav-logout").addEventListener("click", async (e) =
 })();
 
 buildPickers();
+buildExactJump();
 buildSearch();
 route();
 startSse();
