@@ -53,6 +53,18 @@
   .row .kind { color: var(--muted); font-size: 11px; margin-left: 4px; }
   .row.k-AssistantMessage .body { opacity: 0.92; }
   .row.k-ToolResult .body { color: var(--muted); }
+  .row details.tool-result { display: inline; }
+  .row details.tool-result > summary {
+    display: inline; cursor: pointer; color: var(--muted); font-weight: bold;
+    list-style: none;
+  }
+  .row details.tool-result > summary::-webkit-details-marker { display: none; }
+  .row details.tool-result[open] > summary { color: var(--accent); }
+  .row .tool-result-content {
+    display: block; margin: 2px 0 2px 2ch; white-space: pre-wrap;
+    color: var(--muted); font: inherit;
+  }
+  .row .tool-result-content.error { color: var(--danger); }
   .row.k-SystemMessage .body { color: var(--muted); font-style: italic; }
   .row.k-SlashCommand .body { color: var(--warning); }
   .row.k-UserMessage .body, .row.k-AgentSendMessage .body { color: var(--info); }
@@ -315,6 +327,15 @@ function renderRow(ev) {
     el("span", { class: "arrow" }, "·"),
   );
   const text = bodyText(ev);
+  if (ev.kind === "ToolResult") {
+    const result = el("pre", {
+      class: `tool-result-content${ev.message && ev.message.is_error ? " error" : ""}`,
+    }, text);
+    return el("div", { class: "row k-ToolResult" }, head,
+      el("details", { class: "tool-result" },
+        el("summary", { title: "Show tool result", "aria-label": "Show tool result" }, "+"),
+        result));
+  }
   const lines = text.split("\n");
   const row = el("div", { class: `row k-${ev.kind}` }, head,
     el("span", { class: "body" }, lines[0] || ""));

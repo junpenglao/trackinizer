@@ -24,6 +24,7 @@ import pytest
 from trackinizer.trax.run import session as session_mod
 from trackinizer.trax.run.adapters.antigravity import AntigravityAdapter
 from trackinizer.trax.run.adapters.base import Adapter, Event
+from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.session import (
     RunConfig,
     _drain_filesystem_loop,
@@ -241,6 +242,61 @@ class TestSessionScoping:
             spawn_time=spawn_time,
         )
         assert stats.counts == {"UserMessage": 3}
+
+    def test_fresh_codex_scan_excludes_child_agent_rollout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One root plus one same-time guardian must bind only the root ID."""
+        codex_home = tmp_path / "codex-home"
+        sessions = codex_home / "sessions" / "2026" / "08" / "02"
+        sessions.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        root_id = "019fc0b7-a4b7-77b2-b081-c8fe2fb84d6b"
+        child_id = "019fc0b7-a53c-7430-b039-770e6c19129a"
+        root = sessions / f"rollout-2026-08-02T06-24-48-{root_id}.jsonl"
+        child = sessions / f"rollout-2026-08-02T06-24-48-{child_id}.jsonl"
+        root.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": root_id,
+                        "session_id": root_id,
+                        "source": "cli",
+                    },
+                }
+            )
+            + "\n"
+        )
+        child.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "session_id": root_id,
+                        "source": {"subagent": {"other": "guardian"}},
+                    },
+                }
+            )
+            + "\n"
+        )
+        sink = _RecordingSink()
+        stats = _Stats()
+
+        _scan_and_read(
+            CodexAdapter(),
+            sink,
+            stats,
+            RunConfig(cli_name="codex"),
+            {},
+            buffers={},
+            baseline=frozenset(),
+        )
+
+        assert sink.cli_session_ids == [root_id]
+        assert len(sink.events) == 1
+        assert stats.counts == {"SystemMessage": 1}
 
 
 class TestAntigravityLineDrain:

@@ -742,6 +742,16 @@ def _scan_and_read(
                 continue
             if not path.is_file() or not adapter.matches_session_file(path):
                 continue
+            # Fresh Codex launches share one recursive transcript directory
+            # with any child agents they spawn.  Those child rollouts have the
+            # same cwd and creation time, so the generic baseline/mtime scope
+            # admits them unless their session metadata is consulted.  Binding
+            # a single AgentSession to both root and child IDs is invalid and
+            # previously trapped the drain loop in a traceback on every poll.
+            if isinstance(adapter, CodexAdapter) and not adapter.is_root_session_file(
+                path
+            ):
+                continue
             # Positive per-run id: a file older than this run's spawn belongs to
             # an earlier run the baseline snapshot raced past. Skip it. The
             # grace margin absorbs filesystem mtime granularity (some report

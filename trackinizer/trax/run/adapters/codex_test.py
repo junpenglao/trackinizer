@@ -69,6 +69,53 @@ class TestCodexSessionId:
 
         assert CodexAdapter().session_id_from_path(path) == self._SESSION_ID
 
+    def test_root_rollout_is_selected_for_fresh_capture(self, tmp_path: Path) -> None:
+        path = self._rollout(tmp_path)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self._SESSION_ID,
+                        "session_id": self._SESSION_ID,
+                        "source": "cli",
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        assert CodexAdapter().is_root_session_file(path)
+
+    def test_subagent_rollout_is_excluded_from_fresh_capture(
+        self, tmp_path: Path
+    ) -> None:
+        child_id = "019fa3c1-d5de-7181-a4c6-90dd608fc015"
+        path = self._rollout(tmp_path, child_id)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "session_id": self._SESSION_ID,
+                        "source": {"subagent": {"other": "guardian"}},
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        assert not CodexAdapter().is_root_session_file(path)
+
+    def test_incomplete_metadata_waits_instead_of_claiming_file(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._rollout(tmp_path)
+        path.write_text('{"type":"session_meta","payload":')
+
+        assert not CodexAdapter().is_root_session_file(path)
+
     def test_filename_id_is_used_while_session_meta_is_not_yet_complete(
         self, tmp_path: Path
     ) -> None:
@@ -364,6 +411,49 @@ class TestCodexParseLine:
         assert isinstance(event.message, ToolResult)
         assert event.message.call_id == "x"
         assert event.message.content == "ok"
+
+    def test_custom_tool_call_is_assistant_tool_call(self) -> None:
+        line = _encode(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "custom-1",
+                    "name": "exec",
+                    "input": "pwd",
+                },
+            }
+        )
+
+        event = _parse_one(line)
+
+        assert event is not None
+        assert isinstance(event.message, AssistantMessage)
+        assert event.message.tool_calls[0].id == "custom-1"
+        assert event.message.tool_calls[0].name == "exec"
+        assert event.message.tool_calls[0].args == {"input": "pwd"}
+
+    def test_custom_tool_call_output_is_tool_result(self) -> None:
+        line = _encode(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "custom-1",
+                    "output": [
+                        {"type": "input_text", "text": "command output"},
+                        {"type": "input_text", "text": "metadata"},
+                    ],
+                },
+            }
+        )
+
+        event = _parse_one(line)
+
+        assert event is not None
+        assert isinstance(event.message, ToolResult)
+        assert event.message.call_id == "custom-1"
+        assert event.message.content == "command outputmetadata"
 
     def test_compacted_outer_type_is_compaction(self) -> None:
         line = _encode(

@@ -84,6 +84,39 @@ class CodexAdapter:
             and self._sessions_dir in canonical.parents
         )
 
+    def is_root_session_file(self, path: Path) -> bool:
+        """Whether a rollout belongs to the wrapped root Codex session.
+
+        Current Codex releases write child-agent rollouts beside their root
+        rollout, with the same cwd and creation time.  Directory/mtime scoping
+        therefore cannot distinguish them.  A child identifies itself in its
+        ``session_meta``: ``payload.id`` names the child file while
+        ``payload.session_id`` names its root, and ``source.subagent`` records
+        the child role.  Wait for a complete first record, then reject either
+        positive child signal so one ``trax run`` can never bind to two native
+        session identities.
+        """
+        try:
+            with path.open("rb") as source:
+                raw = source.readline()
+        except OSError:
+            return False
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        if not isinstance(parsed, Mapping) or parsed.get("type") != "session_meta":
+            return False
+        payload = parsed.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        rollout_id = _canonical_uuid(payload.get("id"))
+        root_id = _canonical_uuid(payload.get("session_id"))
+        source = payload.get("source")
+        if isinstance(source, Mapping) and "subagent" in source:
+            return False
+        return rollout_id is None or root_id is None or rollout_id == root_id
+
     def session_id_from_path(self, path: Path) -> str | None:
         """Return Codex's native rollout id, corroborating its two sources.
 
@@ -211,10 +244,21 @@ def _to_message(obj: JSON) -> Message | None:
                 ),
             ),
         )
-    if inner == "function_call_output":
+    if inner == "custom_tool_call":
+        return AssistantMessage(
+            tool_calls=(
+                ToolCall(
+                    id=_str(payload.get("call_id")),
+                    name=_str(payload.get("name")),
+                    args=_custom_tool_args(payload.get("input")),
+                ),
+            ),
+        )
+    if inner in ("function_call_output", "custom_tool_call_output"):
+        output = payload.get("output")
         return ToolResult(
             call_id=_str(payload.get("call_id")),
-            content=_str(payload.get("output")),
+            content=_content_text(output),
         )
     return UnknownMessage(raw=obj)
 
@@ -307,6 +351,18 @@ def _json_args(value: object) -> dict[str, object]:
             return {}
         if isinstance(decoded, Mapping):
             return dict(cast("Mapping[str, object]", decoded))
+    return {}
+
+
+def _custom_tool_args(value: object) -> dict[str, object]:
+    """Preserve Codex custom-tool input even when it is not JSON."""
+    decoded = _json_args(value)
+    if decoded:
+        return decoded
+    if isinstance(value, str):
+        return {"input": value}
+    if isinstance(value, Mapping):
+        return dict(cast("Mapping[str, object]", value))
     return {}
 
 

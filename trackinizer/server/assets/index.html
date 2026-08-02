@@ -247,6 +247,12 @@
   .turn-error { color: var(--danger, #c0392b); }
   .turn-compaction { color: var(--muted); font-style: italic; }
   details.turn-thinking > summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  details.turn-tool-result > summary {
+    cursor: pointer; color: var(--muted); font-weight: 700; font-size: 13px;
+    list-style: none; width: max-content;
+  }
+  details.turn-tool-result > summary::-webkit-details-marker { display: none; }
+  details.turn-tool-result[open] > summary { color: var(--accent); }
 
   /* Modal + picker. */
   #modal-bg {
@@ -1372,11 +1378,15 @@ function renderTurn(ev) {
         el("code", {}, `${tc.name}(${JSON.stringify(tc.args || {})})`)));
     }
   } else if (ev.kind === "ToolResult") {
+    const result = el("div");
     if (m.diff) {
-      body.appendChild(el("pre", { class: "turn-diff" }, m.diff));
+      result.appendChild(el("pre", { class: "turn-diff" }, m.diff));
     } else {
-      body.appendChild(el("pre", { class: m.is_error ? "turn-error" : "" }, m.content || ""));
+      result.appendChild(el("pre", { class: m.is_error ? "turn-error" : "" }, m.content || ""));
     }
+    body.appendChild(el("details", { class: "turn-tool-result" },
+      el("summary", { title: "Show tool result", "aria-label": "Show tool result" }, "+"),
+      result));
   } else if (ev.kind === "Compaction") {
     body.appendChild(el("div", { class: "turn-compaction" },
       `compacted ${m.token_before || 0} → ${m.token_after || 0} tokens`));
