@@ -1,4 +1,4 @@
-"""Bind an explicit Codex resume to one pre-existing transcript."""
+"""Bind an explicit provider resume to one pre-existing transcript."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from uuid import UUID
 import sqlite3
 
 from trackinizer.trax.run.adapters.base import Adapter
+from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.transcript import (
     TranscriptClaim,
@@ -137,15 +138,21 @@ def prepare_explicit_resume(
     *,
     cwd: Path,
 ) -> PreparedResume | None:
-    """Pin an explicit Codex UUID to its current EOF before launch."""
+    """Pin an explicit provider UUID to its current EOF before launch."""
     del cwd
     args = tuple(cli_args)
-    if not isinstance(adapter, CodexAdapter):
+    if isinstance(adapter, CodexAdapter):
+        identity = _select_codex_resume(args)
+        if identity is None:
+            return None
+        selection = _Selection(identity, _resolve_codex(adapter, identity))
+    elif isinstance(adapter, ClaudeAdapter):
+        identity = _select_claude_resume(args)
+        if identity is None:
+            return None
+        selection = _Selection(identity, _resolve_claude(adapter, identity))
+    else:
         return None
-    identity = _select_codex_resume(args)
-    if identity is None:
-        return None
-    selection = _Selection(identity, _resolve_codex(adapter, identity))
 
     try:
         snapshot = snapshot_transcript(
@@ -162,6 +169,101 @@ def prepare_explicit_resume(
         path=selection.path,
         snapshot=snapshot,
     )
+
+
+_CLAUDE_HALT_OPTIONS = frozenset({"-h", "--help", "-v", "--version"})
+
+
+def _select_claude_resume(args: tuple[str, ...]) -> str | None:
+    """Return one explicit Claude resume UUID without changing its argv.
+
+    Claude's ``--resume`` value is optional: a missing value or a non-UUID
+    search term opens an interactive picker.  Neither supplies a pre-launch
+    transcript identity, so fail closed instead of opening a duplicate
+    AgentSession. ``--continue`` has the same ambiguity. ``--fork-session``
+    deliberately creates a new native identity and therefore cannot reconcile
+    the prior AgentSession.
+    """
+    identity: str | None = None
+    fork_session = False
+    continue_session = False
+    options_enabled = True
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if options_enabled and argument == "--":
+            options_enabled = False
+            index += 1
+            continue
+        if not options_enabled:
+            index += 1
+            continue
+        if argument in _CLAUDE_HALT_OPTIONS:
+            return None
+        if argument in {"-c", "--continue"}:
+            continue_session = True
+            index += 1
+            continue
+        if argument == "--fork-session":
+            fork_session = True
+            index += 1
+            continue
+
+        value: str | None = None
+        if argument in {"-r", "--resume"}:
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                raise ResumeBindingError(
+                    "Claude resume requires an explicit session UUID"
+                )
+            value = args[index + 1]
+            index += 2
+        elif argument.startswith("--resume="):
+            value = argument.partition("=")[2]
+            index += 1
+        elif argument.startswith("-r") and len(argument) > 2:
+            value = argument[2:].removeprefix("=")
+            index += 1
+        else:
+            index += 1
+            continue
+
+        selected = _canonical_uuid(value, provider="Claude")
+        if identity is not None and selected != identity:
+            raise ResumeBindingError("Claude resume received multiple session UUIDs")
+        identity = selected
+
+    if identity is None:
+        if continue_session:
+            raise ResumeBindingError(
+                "Claude --continue cannot be bound; use --resume with an explicit UUID"
+            )
+        return None
+    if continue_session:
+        raise ResumeBindingError("Claude resume cannot also use --continue")
+    if fork_session:
+        raise ResumeBindingError(
+            "Claude --fork-session creates a new identity and cannot reconcile a resume"
+        )
+    return identity
+
+
+def _resolve_claude(adapter: ClaudeAdapter, identity: str) -> Path:
+    """Resolve Claude's UUID filename across its project transcript roots."""
+    roots = tuple(adapter.session_dirs())
+    if len(roots) != 1:
+        raise ResumeBindingError("Claude transcript root is unavailable")
+    projects = roots[0].absolute()
+    try:
+        matches = list(projects.glob(f"*/{identity}.jsonl"))
+    except OSError as error:
+        raise ResumeBindingError("Claude transcript lookup failed") from error
+    if not matches:
+        raise ResumeBindingError("Claude resume transcript was not found")
+    if len(matches) > 1:
+        raise ResumeBindingError(
+            "multiple Claude transcripts claim the requested resume UUID"
+        )
+    return matches[0]
 
 
 _CODEX_HALT_OPTIONS = frozenset({"-h", "--help", "-V", "--version"})

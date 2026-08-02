@@ -9,8 +9,9 @@ Three things run side by side:
    not literally inherited fds).
 
 2. A drain thread that emits events from the wrapped process's transcript.
-   Antigravity and explicit Codex resumes bind one exact, provider-proven
-   file; other launches still use the legacy scoped directory scanner.
+   Antigravity and explicit Claude/Codex resumes bind one exact,
+   provider-proven file; other launches still use the legacy scoped directory
+   scanner.
 
 3. When syncing, an inbound-poll thread that drains server-queued messages
    and injects them into the CLI via the pump.
