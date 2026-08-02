@@ -249,28 +249,38 @@ def test_spa_exact_sequence_jump_uses_selected_kind() -> None:
     assert "buildExactJump();" in html
 
 
-def test_tool_results_are_collapsed_by_default_in_both_session_views() -> None:
-    """Console and AgentSession expose tool output only through closed details."""
+def test_tool_and_unknown_results_are_collapsed_in_both_session_views() -> None:
+    """Tool and unknown event bodies are exposed only through closed details."""
     index = _INDEX_HTML.read_text()
     console = _CONSOLE_HTML.read_text()
 
     transcript_branch = index[
-        index.index('} else if (ev.kind === "ToolResult") {') : index.index(
+        index.index(
+            """} else if (ev.kind === "ToolResult" || """
+            """ev.kind === "UnknownMessage") {"""
+        ) : index.index(
             '} else if (ev.kind === "Compaction")',
         )
     ]
     assert 'el("details", { class: "turn-tool-result" }' in transcript_branch
-    assert '"aria-label": "Show tool result"' in transcript_branch
+    assert "title: `Show ${ev.kind}`" in transcript_branch
+    assert """"aria-label": `Show ${ev.kind}`""" in transcript_branch
+    assert 'ev.kind === "UnknownMessage"' in transcript_branch
     assert 'el("summary"' in transcript_branch
     assert '"+"' in transcript_branch
 
     console_branch = console[
-        console.index('if (ev.kind === "ToolResult") {') : console.index(
+        console.index(
+            """if (ev.kind === "ToolResult" || """
+            """ev.kind === "UnknownMessage") {"""
+        ) : console.index(
             'const lines = text.split("\\n");',
         )
     ]
     assert 'el("details", { class: "tool-result" }' in console_branch
-    assert '"aria-label": "Show tool result"' in console_branch
+    assert "title: `Show ${ev.kind}`" in console_branch
+    assert """"aria-label": `Show ${ev.kind}`""" in console_branch
+    assert 'ev.kind === "UnknownMessage"' in console_branch
     assert 'el("summary"' in console_branch
     assert '"+"' in console_branch
 

@@ -327,13 +327,16 @@ function renderRow(ev) {
     el("span", { class: "arrow" }, "·"),
   );
   const text = bodyText(ev);
-  if (ev.kind === "ToolResult") {
+  if (ev.kind === "ToolResult" || ev.kind === "UnknownMessage") {
     const result = el("pre", {
       class: `tool-result-content${ev.message && ev.message.is_error ? " error" : ""}`,
     }, text);
-    return el("div", { class: "row k-ToolResult" }, head,
+    return el("div", { class: `row k-${ev.kind}` }, head,
       el("details", { class: "tool-result" },
-        el("summary", { title: "Show tool result", "aria-label": "Show tool result" }, "+"),
+        el("summary", {
+          title: `Show ${ev.kind}`,
+          "aria-label": `Show ${ev.kind}`,
+        }, "+"),
         result));
   }
   const lines = text.split("\n");

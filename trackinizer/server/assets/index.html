@@ -1377,15 +1377,20 @@ function renderTurn(ev) {
       body.appendChild(el("div", { class: "turn-tool" },
         el("code", {}, `${tc.name}(${JSON.stringify(tc.args || {})})`)));
     }
-  } else if (ev.kind === "ToolResult") {
+  } else if (ev.kind === "ToolResult" || ev.kind === "UnknownMessage") {
     const result = el("div");
-    if (m.diff) {
+    if (ev.kind === "UnknownMessage") {
+      result.appendChild(el("pre", {}, JSON.stringify(m, null, 2)));
+    } else if (m.diff) {
       result.appendChild(el("pre", { class: "turn-diff" }, m.diff));
     } else {
       result.appendChild(el("pre", { class: m.is_error ? "turn-error" : "" }, m.content || ""));
     }
     body.appendChild(el("details", { class: "turn-tool-result" },
-      el("summary", { title: "Show tool result", "aria-label": "Show tool result" }, "+"),
+      el("summary", {
+        title: `Show ${ev.kind}`,
+        "aria-label": `Show ${ev.kind}`,
+      }, "+"),
       result));
   } else if (ev.kind === "Compaction") {
     body.appendChild(el("div", { class: "turn-compaction" },
